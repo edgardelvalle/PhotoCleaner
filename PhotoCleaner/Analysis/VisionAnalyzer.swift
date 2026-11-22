@@ -15,12 +15,16 @@ struct VisionSignals: Sendable {
 /// Each request runs on its own so one failure doesn't lose the others.
 enum VisionAnalyzer {
     static let documentConfidence: Float = 0.8
+    /// Changing this invalidates every cached feature print: bump `AssetAnalyzer.version` too.
+    static let featurePrintRevision = VNGenerateImageFeaturePrintRequestRevision2
 
     static func analyze(_ image: CGImage, orientation: CGImagePropertyOrientation) -> VisionSignals {
         let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
         var signals = VisionSignals()
 
         let featurePrint = VNGenerateImageFeaturePrintRequest()
+        // Pinned so prints made after an SDK update can still be compared with cached ones.
+        featurePrint.revision = featurePrintRevision
         prepare(featurePrint)
         if (try? handler.perform([featurePrint])) != nil, let observation = featurePrint.results?.first {
             signals.featurePrint = try? NSKeyedArchiver.archivedData(withRootObject: observation, requiringSecureCoding: true)

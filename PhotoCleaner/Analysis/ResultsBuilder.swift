@@ -2,9 +2,28 @@ import Foundation
 import Vision
 
 /// Turns the library snapshot plus cached analysis into the three cleanup lists.
-/// Runs off the main actor; keeps decoded feature prints between builds.
+/// Runs off the main actor.
+///
+/// It is the only owner of feature prints in memory: they are decoded once when ingested,
+/// and the archived bytes are dropped everywhere else, so each print is held once.
 actor ResultsBuilder {
-    private var decoded: [String: (data: Data, observation: VNFeaturePrintObservation)] = [:]
+    private var prints: [String: VNFeaturePrintObservation] = [:]
+
+    /// Takes in new analysis results and decodes their feature prints.
+    func ingest(_ snapshots: [AssetAnalysisSnapshot]) {
+        for snapshot in snapshots {
+            prints[snapshot.id] = snapshot.featurePrint.flatMap(VisionAnalyzer.decodeFeaturePrint)
+        }
+    }
+
+    /// Forgets prints for photos that no longer exist.
+    func retain(only ids: Set<String>) {
+        prints = prints.filter { ids.contains($0.key) }
+    }
+
+    func clearCache() {
+        prints.removeAll()
+    }
 
     func build(
         library: LibrarySnapshot,
@@ -26,17 +45,25 @@ actor ResultsBuilder {
         // Duplicates
         let photos = visible.filter { !$0.isScreenshot }
         let items = photos.map {
-            GroupingItem(id: $0.id, date: $0.creationDate, dHash: analyses[$0.id]?.dHash, burstID: $0.burstIdentifier)
+            GroupingItem(
+                id: $0.id,
+                date: $0.creationDate,
+                dHash: analyses[$0.id]?.dHash,
+                burstID: $0.burstIdentifier,
+                pixelWidth: $0.pixelWidth,
+                pixelHeight: $0.pixelHeight
+            )
         }
         var grouper = SimilarityGrouper()
         grouper.featureThreshold = settings.similarityThreshold
         let rawGroups = grouper.group(items) { a, b in
-            guard let printA = self.featurePrint(a, analyses), let printB = self.featurePrint(b, analyses) else { return nil }
+            guard let printA = self.prints[a], let printB = self.prints[b] else { return nil }
             return VisionAnalyzer.distance(printA, printB)
         }
 
         var groupedIDs = Set<String>()
-        for ids in rawGroups {
+        for raw in rawGroups {
+            let ids = raw.ids
             let candidates = ids.compactMap { id -> KeeperCandidate? in
                 guard let meta = metasByID[id] else { return nil }
                 return KeeperCandidate(
@@ -50,22 +77,21 @@ actor ResultsBuilder {
             guard let keeper = KeeperPicker.pick(candidates) else { continue }
             groupedIDs.formUnion(ids)
 
-            let keeperHash = analyses[keeper.id]?.dHash
-            let allCopies = ids.allSatisfy { id in
-                guard let keeperHash, let hash = analyses[id]?.dHash else { return false }
-                return DHash.distance(keeperHash, hash) <= 2
-            }
             let savings = ids.filter { $0 != keeper.id }
                 .reduce(Int64(0)) { $0 + (metasByID[$1]?.asset.estimatedBytes ?? 0) }
+            let protected = Set(ids.filter { id in
+                id != keeper.id && (metasByID[id]?.isFavorite == true || settings.keptIDs.contains(id))
+            })
 
             results.duplicateGroups.append(DuplicateGroup(
                 id: ids.joined(separator: "|"),
                 memberIDs: ids,
                 keeperID: keeper.id,
                 keeperReason: keeper.reason,
-                kind: allCopies ? .exactCopies : .similarShots,
+                kind: raw.isExactCopies ? .exactCopies : .similarShots,
                 date: metasByID[ids.last!]?.creationDate ?? .distantPast,
-                estimatedSavings: savings
+                estimatedSavings: savings,
+                protectedIDs: protected
             ))
         }
 
@@ -92,17 +118,5 @@ actor ResultsBuilder {
         }
         results.oneOffs.sort { $0.date < $1.date }
         return results
-    }
-
-    private func featurePrint(_ id: String, _ analyses: [String: AssetAnalysisSnapshot]) -> VNFeaturePrintObservation? {
-        guard let data = analyses[id]?.featurePrint else { return nil }
-        if let cached = decoded[id], cached.data == data { return cached.observation }
-        guard let observation = VisionAnalyzer.decodeFeaturePrint(data) else { return nil }
-        decoded[id] = (data, observation)
-        return observation
-    }
-
-    func clearCache() {
-        decoded.removeAll()
     }
 }

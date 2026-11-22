@@ -5,89 +5,138 @@ struct GroupingItem: Sendable, Equatable {
     let date: Date
     let dHash: UInt64?
     let burstID: String?
+    var pixelWidth: Int = 0
+    var pixelHeight: Int = 0
 }
 
-/// Finds groups of duplicate and near-duplicate photos without comparing every pair.
+struct RawGroup: Sendable, Equatable {
+    /// Members in date order.
+    var ids: [String]
+    /// True when every member is a pixel-level copy of the first one.
+    var isExactCopies: Bool
+}
+
+/// Finds groups of duplicate and near-duplicate photos without comparing every pair,
+/// and without chaining (A looks like B, B looks like C, so A, B and C end up together).
 ///
-/// 1. Identical hashes anywhere in the library are linked (exact copies saved on different days).
-/// 2. Photos from the same burst are linked.
-/// 3. Photos are split into "sessions" wherever there is a long gap between shots, and only
-///    photos close together inside a session are compared, by dHash and by Vision feature print.
-/// Links are merged with union-find; every set of two or more photos is a group.
+/// 1. Exact copies anywhere in the library: identical, high-contrast dHash and identical
+///    pixel dimensions. Equality can't chain, so these groups stay tight.
+/// 2. Photos from the same burst.
+/// 3. Everything else is split into "sessions" at long gaps between shots. Inside a session
+///    each group has an anchor (its first photo), and a photo joins a group only if it is
+///    alike with that anchor, by dHash or by Vision feature print.
+/// Each photo belongs to at most one group.
 struct SimilarityGrouper {
     /// A gap longer than this between two shots starts a new session.
     var sessionGap: TimeInterval = 10 * 60
     /// Vision feature print distance at or below which two photos count as "similar".
     var featureThreshold: Float = 0.35
-    /// dHash bit distance at or below which two photos count as copies.
+    /// dHash bit distance at or below which two photos in one session count as alike.
     var hashThreshold: Int = 4
-    /// Inside a session, each photo is compared with at most this many following photos.
+    /// dHash bit distance at or below which a session group still counts as exact copies.
+    var copyThreshold: Int = 2
+    /// A photo is only compared with groups anchored within this many photos before it.
     var neighborWindow: Int = 40
 
-    /// Returns groups of ids (each in date order), newest group first.
-    func group(_ items: [GroupingItem], featureDistance: (String, String) -> Float?) -> [[String]] {
+    private struct ExactKey: Hashable {
+        let hash: UInt64
+        let width: Int
+        let height: Int
+    }
+
+    /// Returns groups of two or more photos, newest group first.
+    func group(_ items: [GroupingItem], featureDistance: (String, String) -> Float?) -> [RawGroup] {
         guard items.count > 1 else { return [] }
         let sorted = items.sorted { $0.date < $1.date }
-        var sets = UnionFind(count: sorted.count)
+        var claimed = Set<Int>()
+        var found: [(indices: [Int], exact: Bool)] = []
 
-        var firstIndexByHash: [UInt64: Int] = [:]
-        var firstIndexByBurst: [String: Int] = [:]
+        // 1. Exact copies anywhere.
+        var byKey: [ExactKey: [Int]] = [:]
         for (index, item) in sorted.enumerated() {
-            if let hash = item.dHash, DHash.isInformative(hash) {
-                if let other = firstIndexByHash[hash] { sets.union(index, other) } else { firstIndexByHash[hash] = index }
-            }
-            if let burst = item.burstID {
-                if let other = firstIndexByBurst[burst] { sets.union(index, other) } else { firstIndexByBurst[burst] = index }
-            }
+            guard let hash = item.dHash, DHash.isStrong(hash) else { continue }
+            byKey[ExactKey(hash: hash, width: item.pixelWidth, height: item.pixelHeight), default: []].append(index)
+        }
+        for members in byKey.values where members.count > 1 {
+            found.append((members, true))
+            claimed.formUnion(members)
         }
 
+        // 2. Bursts.
+        var byBurst: [String: [Int]] = [:]
+        for (index, item) in sorted.enumerated() where !claimed.contains(index) {
+            if let burst = item.burstID { byBurst[burst, default: []].append(index) }
+        }
+        for members in byBurst.values where members.count > 1 {
+            found.append((members, false))
+            claimed.formUnion(members)
+        }
+
+        // 3. Sessions, clustered around anchors.
         var sessionStart = 0
         for end in 1...sorted.count {
             let isBoundary = end == sorted.count
                 || sorted[end].date.timeIntervalSince(sorted[end - 1].date) > sessionGap
             guard isBoundary else { continue }
-            linkSession(sorted, range: sessionStart..<end, sets: &sets, featureDistance: featureDistance)
+            let pool = (sessionStart..<end).filter { !claimed.contains($0) }
+            for cluster in clusterSession(sorted, pool: pool, featureDistance: featureDistance) where cluster.count > 1 {
+                let anchor = sorted[cluster[0]]
+                let exact = cluster.dropFirst().allSatisfy { isCopy(anchor, sorted[$0], within: copyThreshold) }
+                found.append((cluster, exact))
+            }
             sessionStart = end
         }
 
-        var membersByRoot: [Int: [Int]] = [:]
-        for index in sorted.indices {
-            membersByRoot[sets.find(index), default: []].append(index)
-        }
-        return membersByRoot.values
-            .filter { $0.count > 1 }
-            .sorted { sorted[$0.last!].date > sorted[$1.last!].date }
-            .map { $0.map { sorted[$0].id } }
+        return found
+            .map { (indices: $0.indices.sorted(), exact: $0.exact) }
+            .sorted { sorted[$0.indices.last!].date > sorted[$1.indices.last!].date }
+            .map { RawGroup(ids: $0.indices.map { sorted[$0].id }, isExactCopies: $0.exact) }
     }
 
-    private func linkSession(
+    private func clusterSession(
         _ items: [GroupingItem],
-        range: Range<Int>,
-        sets: inout UnionFind,
+        pool: [Int],
         featureDistance: (String, String) -> Float?
-    ) {
-        guard range.count > 1 else { return }
-        for i in range {
-            let upper = min(range.upperBound, i + 1 + neighborWindow)
-            guard i + 1 < upper else { continue }
-            for j in (i + 1)..<upper {
-                if sets.find(i) == sets.find(j) { continue }
-                if areAlike(items[i], items[j], featureDistance: featureDistance) {
-                    sets.union(i, j)
-                }
+    ) -> [[Int]] {
+        var clusters: [[Int]] = []
+        var anchorPosition: [Int] = [] // position in `pool` of each cluster's anchor
+        var active: [Int] = []          // clusters still close enough to join
+
+        for (position, index) in pool.enumerated() {
+            active.removeAll { position - anchorPosition[$0] > neighborWindow }
+            let item = items[index]
+            if let match = active.first(where: { areAlike(items[clusters[$0][0]], item, featureDistance: featureDistance) }) {
+                clusters[match].append(index)
+            } else {
+                clusters.append([index])
+                anchorPosition.append(position)
+                active.append(clusters.count - 1)
             }
         }
+        return clusters
     }
 
     private func areAlike(_ a: GroupingItem, _ b: GroupingItem, featureDistance: (String, String) -> Float?) -> Bool {
-        if let hashA = a.dHash, let hashB = b.dHash,
-           DHash.isInformative(hashA), DHash.isInformative(hashB),
-           DHash.distance(hashA, hashB) <= hashThreshold {
-            return true
-        }
+        if isCopy(a, b, within: hashThreshold) { return true }
         if let distance = featureDistance(a.id, b.id) {
             return distance <= featureThreshold
         }
         return false
+    }
+
+    private func isCopy(_ a: GroupingItem, _ b: GroupingItem, within bits: Int) -> Bool {
+        guard let hashA = a.dHash, let hashB = b.dHash,
+              DHash.isStrong(hashA), DHash.isStrong(hashB),
+              Self.sameShape(a, b)
+        else { return false }
+        return DHash.distance(hashA, hashB) <= bits
+    }
+
+    /// Same aspect ratio within 1%. Unknown sizes (0) don't block a match.
+    static func sameShape(_ a: GroupingItem, _ b: GroupingItem) -> Bool {
+        guard a.pixelWidth > 0, a.pixelHeight > 0, b.pixelWidth > 0, b.pixelHeight > 0 else { return true }
+        let ratioA = Double(a.pixelWidth) / Double(a.pixelHeight)
+        let ratioB = Double(b.pixelWidth) / Double(b.pixelHeight)
+        return abs(ratioA - ratioB) / ratioA < 0.01
     }
 }

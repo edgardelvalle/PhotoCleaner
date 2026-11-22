@@ -14,6 +14,14 @@ struct AssetAnalysisSnapshot: Sendable, Equatable {
     var hasDocument = false
     var textCharacterCount = 0
     var hasReceiptWords = false
+
+    /// The same snapshot without the archived feature print. Prints live only in
+    /// `ResultsBuilder` once decoded, so memory holds one copy.
+    var withoutFeaturePrint: AssetAnalysisSnapshot {
+        var copy = self
+        copy.featurePrint = nil
+        return copy
+    }
 }
 
 /// On-disk cache of analysis results, keyed by asset id. A photo is analyzed again only

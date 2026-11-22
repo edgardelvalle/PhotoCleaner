@@ -16,6 +16,12 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("Use cellular data for iCloud photos", isOn: $preferences.useCellularForICloud)
+                } footer: {
+                    Text("Photos stored only in iCloud need a small download to be checked. When this is off, they’re skipped on cellular and checked next time you’re on Wi-Fi.")
+                }
+
+                Section {
                     Slider(value: $preferences.similarityThreshold, in: 0.2...0.5, step: 0.05) {
                         Text("Similar photo strictness")
                     } minimumValueLabel: {
@@ -45,7 +51,7 @@ struct SettingsView: View {
                 }
 
                 Section("Privacy") {
-                    Text("Everything happens on this device. Photo Cleaner has no account, no analytics, no ads and no network code.")
+                    Text("Everything happens on this device. Photo Cleaner has no account, no analytics and no ads, and never sends your photos or data anywhere.")
                         .foregroundStyle(.secondary)
                 }
             }

@@ -109,6 +109,11 @@ struct DashboardView: View {
                 Text("Last scan \(date, style: .relative) ago")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                if model.skippedForCellular > 0 {
+                    Text("\(model.skippedForCellular) iCloud photos were skipped on cellular. They’ll be checked on Wi-Fi.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .card()

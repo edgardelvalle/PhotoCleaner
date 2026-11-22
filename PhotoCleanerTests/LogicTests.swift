@@ -9,11 +9,18 @@ final class DHashTests: XCTestCase {
         XCTAssertEqual(DHash.hash(grayscale: pixels), UInt64.max)
     }
 
-    func testFlatImageIsNotInformative() {
-        let pixels = [UInt8](repeating: 128, count: 72)
-        let hash = DHash.hash(grayscale: pixels)
-        XCTAssertEqual(hash, 0)
-        XCTAssertFalse(DHash.isInformative(hash!))
+    func testLowContrastImageHasNoHash() {
+        XCTAssertNil(DHash.hash(grayscale: [UInt8](repeating: 128, count: 72)))
+        // A dark photo with a little noise: range 10, below the contrast floor.
+        let dark = (0..<72).map { UInt8(5 + ($0 * 7) % 11) }
+        XCTAssertNil(DHash.hash(grayscale: dark))
+    }
+
+    func testWeakHashesAreNotStrong() {
+        XCTAssertFalse(DHash.isStrong(0))
+        XCTAssertFalse(DHash.isStrong(0b111))
+        XCTAssertFalse(DHash.isStrong(.max))
+        XCTAssertTrue(DHash.isStrong(0xF0F0_F0F0))
     }
 
     func testWrongSizeReturnsNil() {
@@ -40,9 +47,15 @@ final class UnionFindTests: XCTestCase {
 final class SimilarityGrouperTests: XCTestCase {
     private let base = Date(timeIntervalSince1970: 1_700_000_000)
 
-    private func item(_ id: String, minutes: Double, hash: UInt64? = nil, burst: String? = nil) -> GroupingItem {
-        GroupingItem(id: id, date: base.addingTimeInterval(minutes * 60), dHash: hash, burstID: burst)
+    private func item(
+        _ id: String, minutes: Double, hash: UInt64? = nil, burst: String? = nil,
+        width: Int = 4032, height: Int = 3024
+    ) -> GroupingItem {
+        GroupingItem(id: id, date: base.addingTimeInterval(minutes * 60), dHash: hash, burstID: burst,
+                     pixelWidth: width, pixelHeight: height)
     }
+
+    private func ids(_ groups: [RawGroup]) -> [[String]] { groups.map(\.ids) }
 
     func testIdenticalHashesGroupAcrossDays() {
         let items = [
@@ -51,7 +64,30 @@ final class SimilarityGrouperTests: XCTestCase {
             item("c", minutes: 60 * 24 * 9, hash: 0x0F0F_9999),
         ]
         let groups = SimilarityGrouper().group(items) { _, _ in nil }
-        XCTAssertEqual(groups, [["a", "b"]])
+        XCTAssertEqual(groups, [RawGroup(ids: ["a", "b"], isExactCopies: true)])
+    }
+
+    func testSameHashDifferentSizeIsNotACopyAcrossDays() {
+        let items = [
+            item("a", minutes: 0, hash: 0xF0F0_1234),
+            item("b", minutes: 60 * 24 * 5, hash: 0xF0F0_1234, width: 1080, height: 1920),
+        ]
+        XCTAssertTrue(SimilarityGrouper().group(items) { _, _ in nil }.isEmpty)
+    }
+
+    func testWeakHashesDoNotMatchAcrossDays() {
+        let weak: UInt64 = 0b1011 // only 3 bits set
+        let items = [item("a", minutes: 0, hash: weak), item("b", minutes: 60 * 24 * 5, hash: weak)]
+        XCTAssertTrue(SimilarityGrouper().group(items) { _, _ in nil }.isEmpty)
+    }
+
+    func testNoChainingThroughAMiddlePhoto() {
+        // a~b and b~c, but a and c are not alike: c must not join a's group.
+        let items = [item("a", minutes: 0), item("b", minutes: 1), item("c", minutes: 2)]
+        let distances: [String: Float] = ["a|b": 0.3, "b|c": 0.3, "a|c": 0.6]
+        let groups = SimilarityGrouper().group(items) { distances["\($0)|\($1)"] }
+        XCTAssertEqual(ids(groups), [["a", "b"]])
+        XCTAssertFalse(groups[0].isExactCopies)
     }
 
     func testNearHashesOnlyGroupWithinSession() {
@@ -63,20 +99,20 @@ final class SimilarityGrouperTests: XCTestCase {
             item("c", minutes: 600, hash: nearlyClose ^ 0b1000_0000), // other session
         ]
         let groups = SimilarityGrouper().group(items) { _, _ in nil }
-        XCTAssertEqual(groups, [["a", "b"]])
+        XCTAssertEqual(ids(groups), [["a", "b"]])
     }
 
     func testFeatureDistanceUsesThreshold() {
         let items = [item("a", minutes: 0), item("b", minutes: 1), item("c", minutes: 2)]
         let distances: [String: Float] = ["a|b": 0.2, "b|c": 0.6, "a|c": 0.7]
         let groups = SimilarityGrouper().group(items) { distances["\($0)|\($1)"] }
-        XCTAssertEqual(groups, [["a", "b"]])
+        XCTAssertEqual(ids(groups), [["a", "b"]])
     }
 
     func testBurstsAreGrouped() {
         let items = [item("a", minutes: 0, burst: "x"), item("b", minutes: 0.1, burst: "x"), item("c", minutes: 0.2)]
         let groups = SimilarityGrouper().group(items) { _, _ in nil }
-        XCTAssertEqual(groups, [["a", "b"]])
+        XCTAssertEqual(ids(groups), [["a", "b"]])
     }
 
     func testNewestGroupFirst() {
@@ -87,7 +123,7 @@ final class SimilarityGrouperTests: XCTestCase {
             item("new2", minutes: 5001, hash: 0xBBBB),
         ]
         let groups = SimilarityGrouper().group(items) { _, _ in nil }
-        XCTAssertEqual(groups, [["new1", "new2"], ["old1", "old2"]])
+        XCTAssertEqual(ids(groups), [["new1", "new2"], ["old1", "old2"]])
     }
 }
 

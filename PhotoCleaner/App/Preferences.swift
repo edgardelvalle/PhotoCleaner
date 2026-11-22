@@ -13,6 +13,7 @@ final class Preferences {
         static let cleanupAddedDates = "cleanupAddedDates"
         static let cleanupAlbumID = "cleanupAlbumID"
         static let lifetimeFreedBytes = "lifetimeFreedBytes"
+        static let useCellularForICloud = "useCellularForICloud"
     }
 
     static let defaultSimilarityThreshold = 0.35
@@ -33,6 +34,8 @@ final class Preferences {
     }
     var cleanupAlbumID: String? { didSet { defaults.set(cleanupAlbumID, forKey: Key.cleanupAlbumID) } }
     var lifetimeFreedBytes: Int64 { didSet { defaults.set(lifetimeFreedBytes, forKey: Key.lifetimeFreedBytes) } }
+    /// Download iCloud-only photos for scanning over cellular. Off by default.
+    var useCellularForICloud: Bool { didSet { defaults.set(useCellularForICloud, forKey: Key.useCellularForICloud) } }
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -45,6 +48,7 @@ final class Preferences {
         cleanupAddedDates = rawDates.mapValues { Date(timeIntervalSince1970: $0) }
         cleanupAlbumID = defaults.string(forKey: Key.cleanupAlbumID)
         lifetimeFreedBytes = Int64(defaults.integer(forKey: Key.lifetimeFreedBytes))
+        useCellularForICloud = defaults.bool(forKey: Key.useCellularForICloud)
     }
 
     /// Forgets bookkeeping for photos that are no longer in the cleanup album.

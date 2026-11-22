@@ -11,7 +11,9 @@ struct AssetMeta: @unchecked Sendable {
     let isFavorite: Bool
     let isScreenshot: Bool
     let burstIdentifier: String?
-    let pixelCount: Int
+    let pixelWidth: Int
+    let pixelHeight: Int
+    var pixelCount: Int { pixelWidth * pixelHeight }
 
     init(_ asset: PHAsset) {
         self.asset = asset
@@ -21,7 +23,8 @@ struct AssetMeta: @unchecked Sendable {
         isFavorite = asset.isFavorite
         isScreenshot = asset.mediaSubtypes.contains(.photoScreenshot)
         burstIdentifier = asset.burstIdentifier
-        pixelCount = asset.pixelWidth * asset.pixelHeight
+        pixelWidth = asset.pixelWidth
+        pixelHeight = asset.pixelHeight
     }
 }
 
@@ -31,14 +34,15 @@ struct LibrarySnapshot: @unchecked Sendable {
     /// Photos that are in at least one album (user albums, shared albums...), except ours.
     var albumMemberIDs: Set<String> = []
     var cleanupAlbumID: String?
-    /// Contents of "Cleaner: To Delete", including hidden photos. Newest first.
+    /// Contents of "Cleaner: To Delete" (including hidden photos), plus any photo the app hid
+    /// that is no longer in the album, so it can't get stranded in Hidden. Newest first.
     var cleanupAssets: [PHAsset] = []
     var cleanupIDs: Set<String> { Set(cleanupAssets.map(\.localIdentifier)) }
 }
 
 enum LibraryReader {
     /// Reads the library. Runs off the main thread; PhotoKit fetches are thread-safe.
-    static func read(cleanupAlbumID: String?) -> LibrarySnapshot {
+    static func read(cleanupAlbumID: String?, hiddenByApp: Set<String>) -> LibrarySnapshot {
         var snapshot = LibrarySnapshot()
 
         let options = PHFetchOptions()
@@ -60,6 +64,17 @@ enum LibraryReader {
                 cleanupAssets.append(asset)
             }
             snapshot.cleanupAssets = cleanupAssets
+        }
+
+        // Photos the app hid but that are no longer in the album (for example because the
+        // album was deleted in the Photos app) still show up in To Delete for restoring.
+        let missing = hiddenByApp.subtracting(snapshot.cleanupAssets.map(\.localIdentifier))
+        if !missing.isEmpty {
+            let hiddenOptions = PHFetchOptions()
+            hiddenOptions.includeHiddenAssets = true
+            PHAsset.fetchAssets(withLocalIdentifiers: Array(missing), options: hiddenOptions).enumerateObjects { asset, _, _ in
+                if asset.isHidden { snapshot.cleanupAssets.append(asset) }
+            }
         }
 
         var members = Set<String>()

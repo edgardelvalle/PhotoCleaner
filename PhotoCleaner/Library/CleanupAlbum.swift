@@ -52,10 +52,12 @@ struct CleanupAlbum {
         return Set(toHide.map(\.localIdentifier))
     }
 
-    /// Takes photos out of the album and un-hides the ones the app hid.
-    func restore(_ assets: [PHAsset], from album: PHAssetCollection, unhiding hiddenByApp: Set<String>) async throws {
+    /// Takes photos out of the album (if it still exists) and un-hides the ones the app hid.
+    func restore(_ assets: [PHAsset], from album: PHAssetCollection?, unhiding hiddenByApp: Set<String>) async throws {
         try await PHPhotoLibrary.shared().performChanges {
-            PHAssetCollectionChangeRequest(for: album)?.removeAssets(assets as NSArray)
+            if let album {
+                PHAssetCollectionChangeRequest(for: album)?.removeAssets(assets as NSArray)
+            }
             for asset in assets where hiddenByApp.contains(asset.localIdentifier) {
                 PHAssetChangeRequest(for: asset).isHidden = false
             }

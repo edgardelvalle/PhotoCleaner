@@ -13,17 +13,20 @@ struct DuplicatesView: View {
                 )
             } else {
                 List {
-                    Section {
-                        Button {
-                            model.markAllDuplicateExtras()
-                        } label: {
-                            Label(
-                                "Keep the best of each, mark \(model.duplicateExtraCount) (\(model.duplicateSavings.bytesText))",
-                                systemImage: "wand.and.stars"
-                            )
+                    let copyIDs = model.oneTapCopyIDs
+                    if !copyIDs.isEmpty {
+                        Section {
+                            Button {
+                                model.markAllExactCopies()
+                            } label: {
+                                Label(
+                                    "Mark \(copyIDs.count) extra copies (\(model.bytes(copyIDs).bytesText))",
+                                    systemImage: "wand.and.stars"
+                                )
+                            }
+                        } footer: {
+                            Text("Only exact copies, keeping one of each. Favorites are never marked. Similar shots need a look, so open each group below. Nothing is deleted yet.")
                         }
-                    } footer: {
-                        Text("The best photo in each group stays. The rest go to your Marked tray; nothing is deleted yet.")
                     }
 
                     Section {
@@ -125,6 +128,6 @@ struct GroupDetailView: View {
         let kind = group.kind == .exactCopies
             ? "These look like copies of the same photo."
             : "These were taken moments apart and look alike."
-        return "\(kind) The one marked Best is suggested to keep (\(group.keeperReason.rawValue.lowercased())). Tap photos to mark or unmark them. Touch and hold to see one larger."
+        return "\(kind) The one marked Best is suggested to keep (\(group.keeperReason.rawValue.lowercased())). Keep best never marks favorites. Tap photos to mark or unmark them. Touch and hold to see one larger."
     }
 }

@@ -8,10 +8,17 @@ import Foundation
 enum DHash {
     static let gridWidth = 9
     static let gridHeight = 8
+    /// Grids with less brightness range than this (dark, foggy or plain photos) produce
+    /// hashes made of noise that match unrelated photos, so they get no hash at all.
+    static let minimumContrast: UInt8 = 16
 
     /// Builds the hash from a 9x8 grayscale grid, row by row (72 values).
+    /// Returns nil for the wrong size or a low-contrast grid.
     static func hash(grayscale pixels: [UInt8]) -> UInt64? {
-        guard pixels.count == gridWidth * gridHeight else { return nil }
+        guard pixels.count == gridWidth * gridHeight,
+              let darkest = pixels.min(), let brightest = pixels.max(),
+              brightest - darkest >= minimumContrast
+        else { return nil }
         var hash: UInt64 = 0
         for row in 0..<gridHeight {
             for column in 0..<(gridWidth - 1) {
@@ -29,9 +36,9 @@ enum DHash {
         (a ^ b).nonzeroBitCount
     }
 
-    /// Flat images (all black, all white, a solid colour) produce all-zero or all-one hashes
-    /// that would match every other flat image, so they are ignored for grouping.
-    static func isInformative(_ hash: UInt64) -> Bool {
-        hash != 0 && hash != UInt64.max
+    /// Hashes with very few or very many set bits come from nearly uniform gradients
+    /// (skies, walls, plain backgrounds) and match too easily to trust.
+    static func isStrong(_ hash: UInt64) -> Bool {
+        (8...56).contains(hash.nonzeroBitCount)
     }
 }

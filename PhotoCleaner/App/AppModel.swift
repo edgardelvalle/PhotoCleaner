@@ -13,6 +13,8 @@ enum AppSection: Hashable {
 @Observable
 final class AppModel {
     static let scanConcurrency = 4
+    /// During a scan, the cleanup lists are rebuilt at most this often.
+    static let refreshInterval: TimeInterval = 10
 
     var authorization: PHAuthorizationStatus
     var selectedSection: AppSection = .overview
@@ -22,6 +24,8 @@ final class AppModel {
     var showTray = false
     var isWorking = false
     var errorMessage: String?
+    /// iCloud photos skipped in the last scan because of a cellular connection.
+    var skippedForCellular = 0
 
     let preferences = Preferences()
     let tray = TrayStore()
@@ -35,6 +39,8 @@ final class AppModel {
     @ObservationIgnored private var rescanWhenDone = false
     @ObservationIgnored private var changeDebounce: Task<Void, Never>?
     @ObservationIgnored private var isObserving = false
+    /// Library changes before this time are the app's own and don't trigger a scan.
+    @ObservationIgnored private var ignoreLibraryChangesUntil = Date.distantPast
     @ObservationIgnored private let builder = ResultsBuilder()
     @ObservationIgnored private let store: AnalysisStore?
     @ObservationIgnored private let album = CleanupAlbum()
@@ -42,6 +48,7 @@ final class AppModel {
 
     init() {
         authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        _ = NetworkMonitor.shared
         store = try? AnalysisStore(modelContainer: ModelContainer(for: AssetAnalysis.self))
         observer.onChange = { [weak self] in
             Task { @MainActor in self?.libraryDidChange() }
@@ -75,6 +82,7 @@ final class AppModel {
     }
 
     private func libraryDidChange() {
+        guard Date() >= ignoreLibraryChangesUntil else { return }
         changeDebounce?.cancel()
         changeDebounce = Task {
             try? await Task.sleep(for: .seconds(2))
@@ -120,6 +128,7 @@ final class AppModel {
         try? await store?.reset()
         await builder.clearCache()
         analyses = [:]
+        analysesLoaded = false
         results = ScanResults()
         scanState = .idle
         startScan()
@@ -128,16 +137,20 @@ final class AppModel {
     private func runScan() async {
         if case .scanning = scanState {} else { scanState = .preparing }
         let albumID = preferences.cleanupAlbumID
+        let hiddenByApp = preferences.hiddenByApp
         let snapshot = await Task.detached(priority: .userInitiated) {
-            LibraryReader.read(cleanupAlbumID: albumID)
+            LibraryReader.read(cleanupAlbumID: albumID, hiddenByApp: hiddenByApp)
         }.value
-        apply(snapshot)
+        apply(snapshot, checkedHiddenIDs: hiddenByApp)
 
         if !analysesLoaded, let store {
-            analyses = (try? await store.allSnapshots()) ?? [:]
+            let cached = (try? await store.allSnapshots()) ?? [:]
+            await builder.ingest(Array(cached.values))
+            analyses = cached.mapValues(\.withoutFeaturePrint)
             analysesLoaded = true
         }
         await refreshResults()
+        var lastRefresh = Date()
 
         let todo = snapshot.metas.filter { meta in
             guard let cached = analyses[meta.id] else { return true }
@@ -146,29 +159,35 @@ final class AppModel {
         let total = snapshot.metas.count
         var done = total - todo.count
         var pending: [AssetAnalysisSnapshot] = []
-        var sinceRefresh = 0
+        var hasNewResults = false
+        var skipped = 0
+        let allowCellular = preferences.useCellularForICloud
         scanState = .scanning(done: done, total: total)
 
         await withTaskGroup(of: AssetAnalysisSnapshot?.self) { group in
             var queue = todo.makeIterator()
             for _ in 0..<Self.scanConcurrency {
                 guard let meta = queue.next() else { break }
-                group.addTask { await AssetAnalyzer.analyze(meta) }
+                group.addTask { await AssetAnalyzer.analyze(meta, allowCellular: allowCellular) }
             }
             while let result = await group.next() {
                 done += 1
-                sinceRefresh += 1
                 if let result {
-                    analyses[result.id] = result
+                    await builder.ingest([result])
+                    analyses[result.id] = result.withoutFeaturePrint
                     pending.append(result)
+                    hasNewResults = true
+                } else {
+                    skipped += 1
                 }
                 scanState = .scanning(done: done, total: total)
                 if pending.count >= 100 {
                     try? await store?.save(pending)
                     pending.removeAll()
                 }
-                if sinceRefresh >= 300 {
-                    sinceRefresh = 0
+                if hasNewResults, Date().timeIntervalSince(lastRefresh) >= Self.refreshInterval {
+                    hasNewResults = false
+                    lastRefresh = Date()
                     await refreshResults()
                 }
                 if Task.isCancelled {
@@ -176,22 +195,26 @@ final class AppModel {
                     break
                 }
                 if let meta = queue.next() {
-                    group.addTask { await AssetAnalyzer.analyze(meta) }
+                    group.addTask { await AssetAnalyzer.analyze(meta, allowCellular: allowCellular) }
                 }
             }
         }
 
         try? await store?.save(pending)
+        skippedForCellular = (!allowCellular && NetworkMonitor.shared.isExpensive) ? skipped : 0
         let existing = Set(snapshot.metas.map(\.id)).union(snapshot.cleanupIDs)
         if !Task.isCancelled {
             try? await store?.prune(keeping: existing)
             analyses = analyses.filter { existing.contains($0.key) }
+            await builder.retain(only: existing)
         }
         await refreshResults()
         scanState = Task.isCancelled ? .idle : .finished(Date())
     }
 
-    private func apply(_ snapshot: LibrarySnapshot) {
+    /// - Parameter checkedHiddenIDs: the hidden-by-app ids the snapshot was read with. Only
+    ///   those can be forgotten, so ids added by an action during the read are kept.
+    private func apply(_ snapshot: LibrarySnapshot, checkedHiddenIDs: Set<String>) {
         library = snapshot
         metasByID = Dictionary(snapshot.metas.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var assets = metasByID.mapValues(\.asset)
@@ -202,6 +225,10 @@ final class AppModel {
             preferences.cleanupAlbumID = id
         }
         preferences.prune(cleanupIDs: snapshot.cleanupIDs)
+        // Forget hidden-by-app ids for photos that were deleted or un-hidden elsewhere.
+        let stillHidden = Set(snapshot.cleanupAssets.filter(\.isHidden).map(\.localIdentifier))
+        let gone = checkedHiddenIDs.subtracting(stillHidden)
+        if !gone.isDisjoint(with: preferences.hiddenByApp) { preferences.hiddenByApp.subtract(gone) }
         tray.prune(keeping: Set(metasByID.keys).subtracting(snapshot.cleanupIDs))
     }
 
@@ -223,6 +250,10 @@ final class AppModel {
     }
 
     var duplicateExtraCount: Int { results.duplicateGroups.reduce(0) { $0 + $1.memberIDs.count - 1 } }
+    /// Extra copies the one-tap action may mark: exact copies only, never favorites or kept photos.
+    var oneTapCopyIDs: [String] {
+        results.duplicateGroups.filter { $0.kind == .exactCopies }.flatMap(\.markableExtraIDs)
+    }
     var duplicateSavings: Int64 { results.duplicateGroups.reduce(0) { $0 + $1.estimatedSavings } }
     var screenshotSavings: Int64 { bytes(results.screenshotIDs) }
     var oneOffSavings: Int64 { bytes(results.oneOffs.map(\.id)) }
@@ -237,12 +268,14 @@ final class AppModel {
 
     // MARK: Marking
 
+    /// Marks every photo in the group except the keeper, favorites and kept photos.
     func markExtras(of group: DuplicateGroup) {
-        tray.add(group.extraIDs)
+        tray.add(group.markableExtraIDs.filter { !preferences.keptIDs.contains($0) })
     }
 
-    func markAllDuplicateExtras() {
-        tray.add(results.duplicateGroups.flatMap(\.extraIDs))
+    /// One tap for exact copies only. Similar shots need a look, so they're not included.
+    func markAllExactCopies() {
+        tray.add(oneTapCopyIDs.filter { !preferences.keptIDs.contains($0) })
     }
 
     func keep(_ id: String) {
@@ -266,8 +299,8 @@ final class AppModel {
     func moveTrayToCleanupAlbum() async -> Bool {
         let assets = tray.orderedIDs.compactMap { asset($0) }
         guard !assets.isEmpty else { return false }
-        isWorking = true
-        defer { isWorking = false }
+        beginOwnChange()
+        defer { endOwnChange() }
         do {
             let collection = try await album.fetchOrCreate(knownID: preferences.cleanupAlbumID)
             preferences.cleanupAlbumID = collection.localIdentifier
@@ -290,8 +323,8 @@ final class AppModel {
         let assets = tray.orderedIDs.compactMap { asset($0) }
         guard !assets.isEmpty else { return false }
         let freed = bytes(assets.map(\.localIdentifier))
-        isWorking = true
-        defer { isWorking = false }
+        beginOwnChange()
+        defer { endOwnChange() }
         do {
             try await album.delete(assets)
             preferences.lifetimeFreedBytes += freed
@@ -304,10 +337,12 @@ final class AppModel {
         }
     }
 
+    /// Works even if the album was deleted: then it only un-hides the photos the app hid.
     func restore(_ assets: [PHAsset]) async {
-        guard !assets.isEmpty, let collection = CleanupAlbum.find(knownID: preferences.cleanupAlbumID) else { return }
-        isWorking = true
-        defer { isWorking = false }
+        guard !assets.isEmpty else { return }
+        let collection = CleanupAlbum.find(knownID: preferences.cleanupAlbumID)
+        beginOwnChange()
+        defer { endOwnChange() }
         do {
             try await album.restore(assets, from: collection, unhiding: preferences.hiddenByApp)
             let ids = assets.map(\.localIdentifier)
@@ -324,8 +359,8 @@ final class AppModel {
         let assets = cleanupAssets
         guard !assets.isEmpty else { return }
         let freed = cleanupBytes
-        isWorking = true
-        defer { isWorking = false }
+        beginOwnChange()
+        defer { endOwnChange() }
         do {
             try await album.delete(assets)
             preferences.lifetimeFreedBytes += freed
@@ -334,6 +369,18 @@ final class AppModel {
         } catch {
             show(error)
         }
+    }
+
+    /// The app's own edits fire library-change notifications; the action itself rescans,
+    /// so those notifications are ignored for a moment.
+    private func beginOwnChange() {
+        isWorking = true
+        ignoreLibraryChangesUntil = .distantFuture
+    }
+
+    private func endOwnChange() {
+        isWorking = false
+        ignoreLibraryChangesUntil = Date().addingTimeInterval(3)
     }
 
     private func show(_ error: Error) {

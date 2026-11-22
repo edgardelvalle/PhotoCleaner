@@ -12,8 +12,12 @@ struct DuplicateGroup: Identifiable, Hashable, Sendable {
     let date: Date
     /// Rough bytes freed by deleting everything except the keeper.
     let estimatedSavings: Int64
+    /// Members that one-tap actions must never mark: favorites and photos the user kept.
+    let protectedIDs: Set<String>
 
     var extraIDs: [String] { memberIDs.filter { $0 != keeperID } }
+    /// Extras that "Keep best" may mark.
+    var markableExtraIDs: [String] { extraIDs.filter { !protectedIDs.contains($0) } }
 
     var title: String {
         switch kind {
