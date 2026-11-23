@@ -10,19 +10,27 @@ enum AssetAnalyzer {
     /// Thumbnail size used for analysis. Vision scales down internally anyway.
     static let analysisSide: CGFloat = 512
 
-    /// - Parameter allowCellular: whether an iCloud-only photo may be downloaded over a
-    ///   cellular or other expensive connection. If not, the photo is skipped and retried later.
-    static func analyze(_ meta: AssetMeta, allowCellular: Bool) async -> AssetAnalysisSnapshot? {
+    /// A device-only image smaller than this is just PhotoKit's tiny preview of an iCloud
+    /// photo; such photos wait for the download pass instead of being analyzed from it.
+    static let minimumLocalSide = 256
+
+    /// - Parameter allowNetwork: whether an iCloud-only photo may be downloaded. If not, or if
+    ///   the download fails, it returns nil and the photo is tried again later.
+    static func analyze(_ meta: AssetMeta, allowNetwork: Bool) async -> AssetAnalysisSnapshot? {
         if Task.isCancelled { return nil }
         var snapshot = AssetAnalysisSnapshot(id: meta.id, modificationDate: meta.modificationDate, analyzerVersion: version)
 
         // Screenshots are found from metadata alone and are not grouped as duplicates in v1.
         if meta.isScreenshot { return snapshot }
 
-        let allowNetwork = allowCellular || !NetworkMonitor.shared.isExpensive
         guard let image = await ImageLoader.image(for: meta.asset, side: analysisSide, allowNetwork: allowNetwork),
               let cgImage = image.cgImage
-        else { return nil } // e.g. iCloud photo while offline or on cellular: retried on the next scan
+        else { return nil } // e.g. iCloud photo while offline or on cellular: retried later
+
+        if !allowNetwork, max(cgImage.width, cgImage.height) < minimumLocalSide,
+           max(meta.pixelWidth, meta.pixelHeight) >= minimumLocalSide {
+            return nil
+        }
 
         snapshot.dHash = DHash.compute(cgImage)
         let signals = VisionAnalyzer.analyze(cgImage, orientation: CGImagePropertyOrientation(image.imageOrientation))

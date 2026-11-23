@@ -108,7 +108,10 @@ actor AnalysisStore {
 
     /// Removes cached rows for photos that no longer exist.
     func prune(keeping ids: Set<String>) throws {
-        let rows = try modelContext.fetch(FetchDescriptor<AssetAnalysis>())
+        // Only the ids are needed; skip loading the feature prints.
+        var descriptor = FetchDescriptor<AssetAnalysis>()
+        descriptor.propertiesToFetch = [\.localIdentifier]
+        let rows = try modelContext.fetch(descriptor)
         var changed = false
         for row in rows where !ids.contains(row.localIdentifier) {
             modelContext.delete(row)

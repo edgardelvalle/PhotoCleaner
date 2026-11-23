@@ -12,7 +12,8 @@ struct VisionSignals: Sendable {
 }
 
 /// Runs Apple's on-device Vision requests on a small thumbnail.
-/// Each request runs on its own so one failure doesn't lose the others.
+/// The main requests run in one `perform` call, so Vision prepares the image once.
+/// If that call fails, each request runs on its own so one failure doesn't lose the others.
 enum VisionAnalyzer {
     static let documentConfidence: Float = 0.8
     /// Changing this invalidates every cached feature print: bump `AssetAnalyzer.version` too.
@@ -25,22 +26,24 @@ enum VisionAnalyzer {
         let featurePrint = VNGenerateImageFeaturePrintRequest()
         // Pinned so prints made after an SDK update can still be compared with cached ones.
         featurePrint.revision = featurePrintRevision
-        prepare(featurePrint)
-        if (try? handler.perform([featurePrint])) != nil, let observation = featurePrint.results?.first {
-            signals.featurePrint = try? NSKeyedArchiver.archivedData(withRootObject: observation, requiringSecureCoding: true)
+        let aesthetics = VNCalculateImageAestheticsScoresRequest()
+        let document = VNDetectDocumentSegmentationRequest()
+        let requests: [VNRequest] = [featurePrint, aesthetics, document]
+        requests.forEach(prepare)
+        if (try? handler.perform(requests)) == nil {
+            for request in requests where (request.results ?? []).isEmpty {
+                try? handler.perform([request])
+            }
         }
 
-        let aesthetics = VNCalculateImageAestheticsScoresRequest()
-        prepare(aesthetics)
-        if (try? handler.perform([aesthetics])) != nil, let observation = aesthetics.results?.first {
+        if let observation = featurePrint.results?.first {
+            signals.featurePrint = try? NSKeyedArchiver.archivedData(withRootObject: observation, requiringSecureCoding: true)
+        }
+        if let observation = aesthetics.results?.first {
             signals.aestheticsScore = Double(observation.overallScore)
             signals.isUtility = observation.isUtility
         }
-
-        let document = VNDetectDocumentSegmentationRequest()
-        prepare(document)
-        if (try? handler.perform([document])) != nil, let observation = document.results?.first,
-           observation.confidence >= documentConfidence {
+        if let observation = document.results?.first, observation.confidence >= documentConfidence {
             signals.hasDocument = true
         }
 

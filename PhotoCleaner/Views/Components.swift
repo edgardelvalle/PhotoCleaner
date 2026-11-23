@@ -2,7 +2,8 @@ import SwiftUI
 import UIKit
 import Photos
 
-/// Loads and shows a photo at about `side` points.
+/// Loads and shows a photo sized to the space it gets on screen, at most `side` points.
+/// A small cached version shows first and is replaced by a sharp one.
 struct AssetImage: View {
     let asset: PHAsset
     var side: CGFloat = 200
@@ -10,6 +11,8 @@ struct AssetImage: View {
 
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
+    @State private var layoutSide: CGFloat = 0
+    @State private var loadedID: String?
 
     var body: some View {
         ZStack {
@@ -20,13 +23,40 @@ struct AssetImage: View {
             } else if contentMode == .fill {
                 Rectangle().fill(.quaternary)
             } else {
+                // Fills the offered space while loading, so the first request has the right size.
                 ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task(id: asset.localIdentifier) {
-            image = await ImageLoader.image(for: asset, side: side * displayScale, manager: ImageLoader.thumbnails)
+        .onGeometryChange(for: CGFloat.self) { max($0.size.width, $0.size.height) } action: { newSide in
+            // Only grow: a fitted image can lay out smaller than its placeholder did.
+            if newSide > layoutSide { layoutSide = newSide }
+        }
+        .task(id: RequestKey(id: asset.localIdentifier, pixels: pixelSide)) {
+            if loadedID != asset.localIdentifier {
+                image = nil
+                loadedID = asset.localIdentifier
+            }
+            guard pixelSide > 0 else { return }
+            let mode: PHImageContentMode = contentMode == .fill ? .aspectFill : .aspectFit
+            for await next in ImageLoader.displayImages(for: asset, pixelSide: pixelSide, contentMode: mode) {
+                // When re-requesting at a larger size, keep the current image over a blurry stand-in.
+                if next.isDegraded && image != nil { continue }
+                image = next.image
+            }
         }
         .accessibilityHidden(true)
+    }
+
+    /// Pixels to request: the laid-out size (capped at `side`), rounded up to a cache bucket.
+    private var pixelSide: CGFloat {
+        guard layoutSide > 0 else { return 0 }
+        return ImageLoader.bucketed(min(layoutSide, side) * displayScale)
+    }
+
+    private struct RequestKey: Equatable {
+        let id: String
+        let pixels: CGFloat
     }
 }
 
@@ -46,7 +76,7 @@ struct SelectableTile: View {
         Button(action: action) {
             Color.clear
                 .aspectRatio(1, contentMode: .fit)
-                .overlay { AssetImage(asset: asset, side: 300, contentMode: contentMode) }
+                .overlay { AssetImage(asset: asset, side: 300, contentMode: contentMode) } // MarkableGrid.tileCap
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay {
                     if isOn {
@@ -114,23 +144,59 @@ struct SelectableTile: View {
 }
 
 /// An adaptive grid of photo ids that toggles each one in the Marked tray.
+/// Thumbnails for the next rows are prepared ahead of scrolling.
 struct MarkableGrid: View {
     let ids: [String]
     var caption: ((String) -> String?)?
 
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.displayScale) private var displayScale
+    @State private var width: CGFloat = 0
+    @State private var prefetchedUpTo = 0
+
+    private static let spacing: CGFloat = 6
+    private static let prefetchAhead = 60
+    private static let tileCap: CGFloat = 300
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: sizeClass == .compact ? 100 : 160), spacing: 6)], spacing: 6) {
-            ForEach(ids, id: \.self) { id in
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: Self.spacing)], spacing: Self.spacing) {
+            ForEach(Array(ids.enumerated()), id: \.element) { index, id in
                 if let asset = model.asset(id) {
                     SelectableTile(asset: asset, isOn: model.tray.contains(id), caption: caption?(id)) {
                         model.tray.toggle(id)
                     }
+                    .onAppear { prefetch(after: index) }
                 }
             }
         }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+        .onChange(of: ids) { prefetchedUpTo = 0 }
+        .onDisappear {
+            ImageLoader.stopPrefetching()
+            prefetchedUpTo = 0
+        }
+    }
+
+    private var minimumTile: CGFloat { sizeClass == .compact ? 100 : 160 }
+
+    /// The pixel size each tile requests, computed the way the adaptive grid lays out
+    /// columns, so prefetched thumbnails match the tiles' own requests.
+    private var tilePixels: CGFloat {
+        guard width > 0 else { return 0 }
+        let columns = max(1, floor((width + Self.spacing) / (minimumTile + Self.spacing)))
+        let tile = (width - Self.spacing * (columns - 1)) / columns
+        return ImageLoader.bucketed(min(tile, Self.tileCap) * displayScale)
+    }
+
+    private func prefetch(after index: Int) {
+        let pixels = tilePixels
+        guard pixels > 0 else { return }
+        let start = max(index + 1, prefetchedUpTo)
+        let end = min(ids.count, index + 1 + Self.prefetchAhead)
+        guard start < end else { return }
+        prefetchedUpTo = end
+        ImageLoader.prefetch(ids[start..<end].compactMap { model.asset($0) }, pixelSide: pixels)
     }
 }
 
