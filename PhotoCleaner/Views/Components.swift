@@ -251,7 +251,7 @@ struct ScanProgressView: View {
         case .scanning(let done, let total):
             VStack(alignment: .leading, spacing: 6) {
                 ProgressView(value: Double(done), total: Double(max(total, 1)))
-                Text("Looked at \(done.formatted()) of \(total.formatted()) photos")
+                Text("Looked at \(done.formatted()) of \(total.formatted()) photos\(remainingText)")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -263,6 +263,17 @@ struct ScanProgressView: View {
         default:
             EmptyView()
         }
+    }
+}
+
+extension ScanProgressView {
+    private var remainingText: String {
+        guard let seconds = model.scanTimeRemaining, seconds >= 60 else { return "" }
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .short
+        formatter.allowedUnits = seconds >= 3600 ? [.hour, .minute] : [.minute]
+        guard let text = formatter.string(from: seconds) else { return "" }
+        return " · about \(text) left"
     }
 }
 

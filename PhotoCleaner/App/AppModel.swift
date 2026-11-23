@@ -2,6 +2,8 @@ import Foundation
 import Photos
 import Observation
 import SwiftData
+import UIKit
+import os
 
 enum AppSection: Hashable {
     case overview, duplicates, screenshots, oneOffs, cleanup
@@ -33,6 +35,8 @@ final class AppModel {
     var errorMessage: String?
     /// iCloud photos skipped in the last scan because of a cellular connection.
     var skippedForCellular = 0
+    /// Rough time left in the current scan, once there is enough to estimate it.
+    var scanTimeRemaining: TimeInterval?
 
     let preferences = Preferences()
     let tray = TrayStore()
@@ -143,6 +147,20 @@ final class AppModel {
 
     private func runScan() async {
         if case .scanning = scanState {} else { scanState = .preparing }
+        // A long first scan stops if the phone locks, so keep the screen on while it runs,
+        // and ask for a little extra time when the app is switched away from.
+        UIApplication.shared.isIdleTimerDisabled = true
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Photo scan") {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+        let started = Date()
+        defer {
+            UIApplication.shared.isIdleTimerDisabled = false
+            scanTimeRemaining = nil
+            if backgroundTask != .invalid { UIApplication.shared.endBackgroundTask(backgroundTask) }
+        }
         let albumID = preferences.cleanupAlbumID
         let hiddenByApp = preferences.hiddenByApp
 
@@ -194,7 +212,11 @@ final class AppModel {
         }
         await refreshResults()
         scanState = Task.isCancelled ? .idle : .finished(Date())
+        let seconds = Date().timeIntervalSince(started)
+        Self.log.info("Scan: \(todo.count) to analyze, \(needDownload.count) needed iCloud, \(skipped) skipped, \(Int(seconds)) s")
     }
+
+    private static let log = Logger(subsystem: "PhotoCleaner", category: "scan")
 
     private struct ScanProgress {
         var done = 0
@@ -221,6 +243,7 @@ final class AppModel {
         var failed: [AssetMeta] = []
         var pending: [AssetAnalysisSnapshot] = []
         let scanStart = Date()
+        var analyzedThisPass = 0
 
         await withTaskGroup(of: (AssetMeta, AssetAnalysisSnapshot?).self) { group in
             var queue = metas.makeIterator()
@@ -232,6 +255,7 @@ final class AppModel {
                 let (meta, result) = next
                 if let result {
                     progress.done += 1
+                    analyzedThisPass += 1
                     analyses[result.id] = result.withoutFeaturePrint
                     unbuilt.append(result)
                     pending.append(result)
@@ -242,6 +266,11 @@ final class AppModel {
                 if now.timeIntervalSince(progress.lastShown) >= Self.progressInterval {
                     progress.lastShown = now
                     scanState = .scanning(done: progress.done, total: progress.total)
+                    let elapsed = now.timeIntervalSince(scanStart)
+                    if analyzedThisPass >= 30, elapsed > 5 {
+                        let rate = Double(analyzedThisPass) / elapsed
+                        scanTimeRemaining = Double(max(0, progress.total - progress.done)) / rate
+                    }
                 }
                 if pending.count >= 200 {
                     let batch = pending
