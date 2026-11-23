@@ -486,7 +486,9 @@ final class AppModel {
     // MARK: Marking
 
     /// Marks every photo in the group except the keeper, favorites and kept photos.
+    /// Unmarks the keeper if it was marked, since this choice keeps it.
     func markExtras(of group: DuplicateGroup) {
+        tray.remove([group.keeperID])
         tray.add(group.markableExtraIDs.filter { !preferences.keptIDs.contains($0) })
     }
 

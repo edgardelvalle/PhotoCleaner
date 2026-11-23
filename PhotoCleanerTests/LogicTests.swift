@@ -300,4 +300,17 @@ final class MarkAllTests: XCTestCase {
         XCTAssertEqual(tray.orderedIDs, ["c", "a", "b"])
         XCTAssertTrue(tray.contains("b"))
     }
+
+    func testNextGroupSkipsGroupsThatAreAlreadyMarked() {
+        let groups = ["1", "2", "3", "4"].map { n in
+            DuplicateGroup(
+                id: n, memberIDs: ["\(n)a", "\(n)b"], keeperID: "\(n)a", keeperReason: .bestQuality,
+                kind: .similarShots, date: .distantPast, estimatedSavings: 0, protectedIDs: []
+            )
+        }
+        let marked: Set<String> = ["2b"]
+        XCTAssertEqual(groups.nextUndecided(after: "1", isMarked: marked.contains)?.id, "3")
+        XCTAssertNil(groups.nextUndecided(after: "4", isMarked: marked.contains))
+        XCTAssertEqual(groups.nextUndecided(after: "gone", isMarked: marked.contains)?.id, "1")
+    }
 }
