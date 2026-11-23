@@ -147,19 +147,9 @@ struct GroupDetailView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) { TrayButton() }
         }
+        // Reviewing is a focused flow; hiding the tab bar keeps its buttons away from the decisions.
+        .toolbar(.hidden, for: .tabBar)
         .sensoryFeedback(.success, trigger: decisions)
-        .confirmationDialog(
-            "Mark all \(group.memberIDs.count) photos for deletion?",
-            isPresented: $confirmMarkAll,
-            titleVisibility: .visible
-        ) {
-            Button("Mark all \(group.memberIDs.count), including Best", role: .destructive) {
-                model.markAll(of: group)
-                advance(after: group)
-            }
-        } message: {
-            Text(markAllMessage(for: group))
-        }
     }
 
     // MARK: Pieces
@@ -190,20 +180,21 @@ struct GroupDetailView: View {
     }
 
     private func actionBar(for group: DuplicateGroup) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 16) {
             Button {
                 model.markExtras(of: group)
                 advance(after: group)
             } label: {
                 Label("Keep best", systemImage: "checkmark.circle.fill")
                     .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 34)
+                    .frame(maxWidth: .infinity, minHeight: 40)
             }
             .buttonStyle(.borderedProminent)
             .tint(.green)
             .keyboardShortcut(.return, modifiers: .command)
 
-            HStack(spacing: 8) {
+            // Keep the destructive button well apart from the others to avoid mis-taps.
+            HStack(spacing: 24) {
                 Button(role: .destructive) {
                     confirmMarkAll = true
                 } label: {
@@ -211,12 +202,26 @@ struct GroupDetailView: View {
                         .frame(maxWidth: .infinity, minHeight: 28)
                 }
                 .tint(.red)
+                // Attached here, not to the screen, so iOS anchors the bubble to this button.
+                .confirmationDialog(
+                    "Mark all \(group.memberIDs.count) photos for deletion?",
+                    isPresented: $confirmMarkAll,
+                    titleVisibility: .visible
+                ) {
+                    Button("Mark all \(group.memberIDs.count), including Best", role: .destructive) {
+                        model.markAll(of: group)
+                        advance(after: group)
+                    }
+                } message: {
+                    Text(markAllMessage(for: group))
+                }
 
                 Button {
                     advance(after: group, decided: false)
                 } label: {
-                    // After marking photos by hand, this is how to move on.
-                    Label(anyMarked ? "Next" : "Skip", systemImage: "arrow.right")
+                    // Moving on without marking keeps the whole group. After marking photos
+                    // by hand, it moves on and keeps the rest.
+                    Label(anyMarked ? "Next" : "Keep all", systemImage: anyMarked ? "arrow.right" : "square.on.square")
                         .frame(maxWidth: .infinity, minHeight: 28)
                 }
                 .keyboardShortcut(.rightArrow, modifiers: .command)
@@ -225,8 +230,8 @@ struct GroupDetailView: View {
         }
         .disabled(isAdvancing)
         .padding(.horizontal)
-        .padding(.top, 10)
-        .padding(.bottom, 6)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
         .background(.bar)
     }
 
@@ -265,6 +270,6 @@ struct GroupDetailView: View {
         let kind = group.kind == .exactCopies
             ? "These look like copies of the same photo."
             : "These were taken moments apart and look alike."
-        return "\(kind) The one marked Best is suggested to keep. Keep best marks the others, but never favorites or photos you kept. Delete all marks the whole group after asking. Tap photos to mark or unmark them, then tap Next. Touch and hold to see one larger. Marked photos wait in the tray, so nothing is deleted yet."
+        return "\(kind) The one marked Best is suggested to keep. Keep best marks the others, but never favorites or photos you kept. Delete all marks the whole group after asking, and Keep all moves on without marking any. Tap photos to mark or unmark them, then tap Next. Touch and hold to see one larger. Marked photos wait in the tray, so nothing is deleted yet."
     }
 }
