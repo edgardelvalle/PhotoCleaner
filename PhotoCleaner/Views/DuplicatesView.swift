@@ -216,8 +216,9 @@ struct GroupDetailView: View {
                 Button {
                     advance(after: group, decided: false)
                 } label: {
-                    // After marking photos by hand, this is how to move on.
-                    Label(anyMarked ? "Next" : "Skip", systemImage: "arrow.right")
+                    // Moving on without marking keeps the whole group. After marking photos
+                    // by hand, it moves on and keeps the rest.
+                    Label(anyMarked ? "Next" : "Keep all", systemImage: anyMarked ? "arrow.right" : "square.on.square")
                         .frame(maxWidth: .infinity, minHeight: 28)
                 }
                 .keyboardShortcut(.rightArrow, modifiers: .command)
@@ -266,6 +267,6 @@ struct GroupDetailView: View {
         let kind = group.kind == .exactCopies
             ? "These look like copies of the same photo."
             : "These were taken moments apart and look alike."
-        return "\(kind) The one marked Best is suggested to keep. Keep best marks the others, but never favorites or photos you kept. Delete all marks the whole group after asking. Tap photos to mark or unmark them, then tap Next. Touch and hold to see one larger. Marked photos wait in the tray, so nothing is deleted yet."
+        return "\(kind) The one marked Best is suggested to keep. Keep best marks the others, but never favorites or photos you kept. Delete all marks the whole group after asking, and Keep all moves on without marking any. Tap photos to mark or unmark them, then tap Next. Touch and hold to see one larger. Marked photos wait in the tray, so nothing is deleted yet."
     }
 }
