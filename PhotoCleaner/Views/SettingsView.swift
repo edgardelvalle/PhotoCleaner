@@ -50,6 +50,12 @@ struct SettingsView: View {
                     Text("Clears what Photo Cleaner learned about your photos and starts over. Use this if results look wrong.")
                 }
 
+                Section {
+                    NavigationLink("Diagnostics") { DiagnosticsView() }
+                } footer: {
+                    Text("Scan counts and timings, for troubleshooting a slow or stuck scan.")
+                }
+
                 Section("Privacy") {
                     Text("Everything happens on this device. Photo Cleaner has no account, no analytics and no ads, and never sends your photos or data anywhere.")
                         .foregroundStyle(.secondary)

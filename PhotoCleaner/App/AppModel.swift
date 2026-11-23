@@ -37,6 +37,8 @@ final class AppModel {
     var skippedForCellular = 0
     /// Rough time left in the current scan, once there is enough to estimate it.
     var scanTimeRemaining: TimeInterval?
+    /// Counts and timings for the current or last scan, for the Diagnostics screen.
+    var scanStats = ScanStats()
 
     let preferences = Preferences()
     let tray = TrayStore()
@@ -60,7 +62,14 @@ final class AppModel {
     init() {
         authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         _ = NetworkMonitor.shared
-        store = try? AnalysisStore(modelContainer: ModelContainer(for: AssetAnalysis.self))
+        do {
+            store = try AnalysisStore(modelContainer: ModelContainer(for: AssetAnalysis.self))
+        } catch {
+            store = nil
+            Log.cache.fault("Analysis cache unavailable, every scan will start from scratch: \(error.localizedDescription, privacy: .public)")
+        }
+        MetricsReporter.shared.start()
+        Log.library.info("Launch: photo access \(self.authorization.logName, privacy: .public)")
         observer.onChange = { [weak self] in
             Task { @MainActor in self?.libraryDidChange() }
         }
@@ -73,6 +82,7 @@ final class AppModel {
 
     func requestAccess() async {
         authorization = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        Log.library.notice("Photo access answered: \(self.authorization.logName, privacy: .public)")
         if hasAccess { activate() }
     }
 
@@ -80,6 +90,7 @@ final class AppModel {
     func refreshAuthorization() {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         guard status != authorization else { return }
+        Log.library.notice("Photo access changed in Settings: \(self.authorization.logName, privacy: .public) to \(status.logName, privacy: .public)")
         authorization = status
         if hasAccess { activate() }
     }
@@ -94,6 +105,7 @@ final class AppModel {
 
     private func libraryDidChange() {
         guard Date() >= ignoreLibraryChangesUntil else { return }
+        Log.library.debug("Photo library changed outside the app; rescanning shortly")
         changeDebounce?.cancel()
         changeDebounce = Task {
             try? await Task.sleep(for: .seconds(2))
@@ -116,6 +128,7 @@ final class AppModel {
     func startScan() {
         guard hasAccess else { return }
         if scanTask != nil {
+            Log.scan.debug("Scan requested while one is running; will rescan when it ends")
             rescanWhenDone = true
             return
         }
@@ -130,13 +143,15 @@ final class AppModel {
     }
 
     func cancelScan() {
+        if scanTask != nil { Log.scan.notice("Scan cancelled") }
         rescanWhenDone = false
         scanTask?.cancel()
     }
 
     func resetAndRescan() async {
+        Log.scan.notice("Resetting the analysis cache and scanning everything again")
         cancelScan()
-        try? await store?.reset()
+        do { try await store?.reset() } catch { record(error, while: "Clearing the analysis cache") }
         await builder.clearCache()
         analyses = [:]
         analysesLoaded = false
@@ -156,25 +171,43 @@ final class AppModel {
             backgroundTask = .invalid
         }
         let started = Date()
+        PhotoMetrics.shared.reset()
+        scanStats = ScanStats(outcome: .running, startedAt: started)
+        Log.scan.notice("Scan started")
+        let scanInterval = Signposts.phases.beginInterval("Scan")
         defer {
             UIApplication.shared.isIdleTimerDisabled = false
             scanTimeRemaining = nil
             if backgroundTask != .invalid { UIApplication.shared.endBackgroundTask(backgroundTask) }
+            Signposts.phases.endInterval("Scan", scanInterval)
         }
         let albumID = preferences.cleanupAlbumID
         let hiddenByApp = preferences.hiddenByApp
 
         // Read the library and load the analysis cache at the same time.
-        let readLibrary = Task.detached(priority: .userInitiated) {
-            LibraryReader.read(cleanupAlbumID: albumID, hiddenByApp: hiddenByApp)
+        let readLibrary = Task.detached(priority: .userInitiated) { () -> (LibrarySnapshot, TimeInterval) in
+            let interval = Signposts.phases.beginInterval("Read library")
+            let start = ContinuousClock.now
+            let snapshot = LibraryReader.read(cleanupAlbumID: albumID, hiddenByApp: hiddenByApp)
+            Signposts.phases.endInterval("Read library", interval)
+            return (snapshot, start.secondsSince)
         }
         if !analysesLoaded, let store {
-            let cached = (try? await store.allSnapshots()) ?? [:]
+            let interval = Signposts.phases.beginInterval("Load cache")
+            let start = ContinuousClock.now
+            var cached: [String: AssetAnalysisSnapshot] = [:]
+            do { cached = try await store.allSnapshots() } catch { record(error, while: "Loading the analysis cache") }
             await builder.ingest(Array(cached.values))
             analyses = cached.mapValues(\.withoutFeaturePrint)
             analysesLoaded = true
+            Signposts.phases.endInterval("Load cache", interval)
+            scanStats.loadCache = start.secondsSince
+            scanStats.cacheRowsLoaded = cached.count
+            Log.cache.info("Loaded \(cached.count) cached analyses in \(self.scanStats.loadCache, format: .fixed(precision: 2)) s")
         }
-        let snapshot = await readLibrary.value
+        let (snapshot, readSeconds) = await readLibrary.value
+        scanStats.readLibrary = readSeconds
+        Log.library.info("Read library: \(snapshot.metas.count) photos, \(snapshot.cleanupAssets.count) in the cleanup album, \(snapshot.albumMemberIDs.count) in albums, \(readSeconds, format: .fixed(precision: 2)) s")
         apply(snapshot, checkedHiddenIDs: hiddenByApp)
         await refreshResults()
 
@@ -185,20 +218,38 @@ final class AppModel {
         let total = snapshot.metas.count
         progress = ScanProgress(done: total - todo.count, total: total)
         scanState = .scanning(done: progress.done, total: total)
+        scanStats.libraryCount = total
+        scanStats.toAnalyze = todo.count
+        scanStats.cacheHits = total - todo.count
+        Log.scan.notice("\(total) photos: \(total - todo.count) cached, \(todo.count) to analyze")
 
         // Pass 1: photos already on the device, newest first. No downloads, so this is fast
         // and most results show up early. Photos that need iCloud are left for pass 2.
+        var passInterval = Signposts.phases.beginInterval("On-device pass", id: Signposts.phases.makeSignpostID(), "\(todo.count) photos")
+        var passStart = ContinuousClock.now
         let needDownload = await analyze(todo, allowNetwork: false, concurrency: Self.localConcurrency)
+        Signposts.phases.endInterval("On-device pass", passInterval)
+        scanStats.localPass = passStart.secondsSince
+        scanStats.neededICloud = needDownload.count
+        updatePhotoStats()
+        Log.scan.notice("On-device pass: \(self.scanStats.photos.analyzedLocal) analyzed in \(self.scanStats.localPass, format: .fixed(precision: 1)) s, \(needDownload.count) need iCloud")
 
         // Pass 2: photos that have to be downloaded from iCloud first.
         let allowCellular = preferences.useCellularForICloud
         var skipped = 0
         if !Task.isCancelled, !needDownload.isEmpty {
             if allowCellular || !NetworkMonitor.shared.isExpensive {
+                passInterval = Signposts.phases.beginInterval("iCloud pass", id: Signposts.phases.makeSignpostID(), "\(needDownload.count) photos")
+                passStart = ContinuousClock.now
                 let failed = await analyze(needDownload, allowNetwork: true, concurrency: Self.downloadConcurrency)
+                Signposts.phases.endInterval("iCloud pass", passInterval)
+                scanStats.iCloudPass = passStart.secondsSince
                 skipped = failed.count
+                updatePhotoStats()
+                Log.scan.notice("iCloud pass: \(self.scanStats.photos.analyzedDownloaded) downloaded and analyzed in \(self.scanStats.iCloudPass, format: .fixed(precision: 1)) s, \(failed.count) failed")
             } else {
                 skipped = needDownload.count
+                Log.scan.notice("Skipping \(needDownload.count) iCloud photos on cellular (cellular is off in Settings)")
             }
         }
         await finishRefresh()
@@ -206,17 +257,58 @@ final class AppModel {
         skippedForCellular = (!allowCellular && NetworkMonitor.shared.isExpensive) ? skipped : 0
         let existing = Set(snapshot.metas.map(\.id)).union(snapshot.cleanupIDs)
         if !Task.isCancelled {
-            try? await store?.prune(keeping: existing)
+            let interval = Signposts.phases.beginInterval("Prune cache")
+            let start = ContinuousClock.now
+            do { try await store?.prune(keeping: existing) } catch { record(error, while: "Pruning the analysis cache") }
             analyses = analyses.filter { existing.contains($0.key) }
             await builder.retain(only: existing)
+            Signposts.phases.endInterval("Prune cache", interval)
+            scanStats.prune = start.secondsSince
         }
         await refreshResults()
-        scanState = Task.isCancelled ? .idle : .finished(Date())
-        let seconds = Date().timeIntervalSince(started)
-        Self.log.info("Scan: \(todo.count) to analyze, \(needDownload.count) needed iCloud, \(skipped) skipped, \(Int(seconds)) s")
+        let cancelled = Task.isCancelled
+        scanState = cancelled ? .idle : .finished(Date())
+
+        updatePhotoStats()
+        scanStats.skippedForCellular = skippedForCellular
+        scanStats.finishedAt = Date()
+        scanStats.outcome = cancelled ? .cancelled : .finished
+        logSummary(scanStats)
     }
 
-    private static let log = Logger(subsystem: "PhotoCleaner", category: "scan")
+    /// Copies the per-photo counters collected off the main thread into `scanStats`.
+    private func updatePhotoStats() {
+        scanStats.photos = PhotoMetrics.shared.snapshot
+    }
+
+    private func logSummary(_ stats: ScanStats) {
+        let p = stats.photos
+        let seconds = stats.elapsed() ?? 0
+        let rate = stats.photosPerSecond ?? 0
+        Log.scan.notice("""
+            Scan \(stats.outcome.rawValue.lowercased(), privacy: .public) in \(seconds, format: .fixed(precision: 1)) s: \
+            \(stats.libraryCount) photos, \(stats.cacheHits) cached, \(stats.toAnalyze) to analyze; \
+            analyzed \(p.analyzedLocal) on device + \(p.analyzedDownloaded) from iCloud + \(p.metadataOnly) screenshots \
+            at \(rate, format: .fixed(precision: 1)) photos/s; \
+            \(p.downloadFailed) downloads failed, \(stats.skippedForCellular) skipped on cellular, \(stats.errors.count) errors
+            """)
+        Log.scan.info("""
+            Scan timings: read library \(stats.readLibrary, format: .fixed(precision: 2)) s, \
+            load cache \(stats.loadCache, format: .fixed(precision: 2)) s, \
+            on-device pass \(stats.localPass, format: .fixed(precision: 1)) s, \
+            iCloud pass \(stats.iCloudPass, format: .fixed(precision: 1)) s, \
+            image load avg \((p.localImageLoad.mean ?? 0) * 1000, format: .fixed(precision: 0)) ms device / \
+            \((p.iCloudImageLoad.mean ?? 0) * 1000, format: .fixed(precision: 0)) ms iCloud, \
+            vision avg \((p.vision.mean ?? 0) * 1000, format: .fixed(precision: 0)) ms, \
+            \(stats.rebuilds.count) rebuilds (max \(stats.rebuilds.max, format: .fixed(precision: 2)) s)
+            """)
+    }
+
+    /// Logs an error that the scan works around, and keeps it for the Diagnostics screen.
+    private func record(_ error: Error, while action: String) {
+        Log.cache.error("\(action, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+        scanStats.addError("\(action): \(error.localizedDescription)")
+    }
 
     private struct ScanProgress {
         var done = 0
@@ -266,6 +358,7 @@ final class AppModel {
                 if now.timeIntervalSince(progress.lastShown) >= Self.progressInterval {
                     progress.lastShown = now
                     scanState = .scanning(done: progress.done, total: progress.total)
+                    updatePhotoStats()
                     let elapsed = now.timeIntervalSince(scanStart)
                     if analyzedThisPass >= 30, elapsed > 5 {
                         let rate = Double(analyzedThisPass) / elapsed
@@ -275,7 +368,7 @@ final class AppModel {
                 if pending.count >= 200 {
                     let batch = pending
                     pending.removeAll()
-                    try? await store?.save(batch)
+                    await save(batch)
                 }
                 let interval = refreshedDuringScan ? Self.refreshInterval : Self.firstRefreshDelay
                 let since = refreshedDuringScan ? lastRefresh : scanStart
@@ -291,9 +384,20 @@ final class AppModel {
                 }
             }
         }
-        try? await store?.save(pending)
+        await save(pending)
         scanState = .scanning(done: progress.done, total: progress.total)
         return failed
+    }
+
+    private func save(_ batch: [AssetAnalysisSnapshot]) async {
+        guard let store, !batch.isEmpty else { return }
+        let start = ContinuousClock.now
+        do {
+            try await store.save(batch)
+            scanStats.cacheSaves.add(start.secondsSince)
+        } catch {
+            record(error, while: "Saving \(batch.count) analyses to the cache")
+        }
     }
 
     /// Rebuilds the lists without holding up the scan loop.
@@ -345,7 +449,13 @@ final class AppModel {
             similarityThreshold: Float(preferences.similarityThreshold),
             keptIDs: preferences.keptIDs
         )
+        let interval = Signposts.phases.beginInterval("Rebuild lists", id: Signposts.phases.makeSignpostID(), "\(self.analyses.count) analyses")
+        let start = ContinuousClock.now
         results = await builder.build(library: library, analyses: analyses, settings: settings)
+        Signposts.phases.endInterval("Rebuild lists", interval)
+        let seconds = start.secondsSince
+        if isScanning { scanStats.rebuilds.add(seconds) }
+        Log.results.debug("Rebuilt lists from \(self.analyses.count) analyses in \(seconds, format: .fixed(precision: 2)) s: \(self.results.duplicateGroups.count) duplicate groups, \(self.results.screenshotIDs.count) screenshots, \(self.results.oneOffs.count) one-offs")
     }
 
     // MARK: Lookups
@@ -415,11 +525,12 @@ final class AppModel {
             preferences.hiddenByApp.formUnion(hidden)
             let now = Date()
             for asset in assets { preferences.cleanupAddedDates[asset.localIdentifier] = now }
+            Log.actions.notice("Moved \(assets.count) photos to the cleanup album (\(hidden.count) hidden)")
             tray.clear()
             startScan()
             return true
         } catch {
-            show(error)
+            show(error, while: "Moving \(assets.count) photos to the cleanup album")
             return false
         }
     }
@@ -435,11 +546,12 @@ final class AppModel {
         do {
             try await album.delete(assets)
             preferences.lifetimeFreedBytes += freed
+            Log.actions.notice("Deleted \(assets.count) photos from the tray")
             tray.clear()
             startScan()
             return true
         } catch {
-            show(error)
+            show(error, while: "Deleting \(assets.count) photos")
             return false
         }
     }
@@ -455,9 +567,10 @@ final class AppModel {
             let ids = assets.map(\.localIdentifier)
             preferences.hiddenByApp.subtract(ids)
             for id in ids { preferences.cleanupAddedDates[id] = nil }
+            Log.actions.notice("Restored \(ids.count) photos")
             startScan()
         } catch {
-            show(error)
+            show(error, while: "Restoring \(assets.count) photos")
         }
     }
 
@@ -472,9 +585,10 @@ final class AppModel {
             try await album.delete(assets)
             preferences.lifetimeFreedBytes += freed
             preferences.hiddenByApp.subtract(assets.map(\.localIdentifier))
+            Log.actions.notice("Emptied the cleanup album: \(assets.count) photos deleted")
             startScan()
         } catch {
-            show(error)
+            show(error, while: "Emptying the cleanup album (\(assets.count) photos)")
         }
     }
 
@@ -490,8 +604,26 @@ final class AppModel {
         ignoreLibraryChangesUntil = Date().addingTimeInterval(3)
     }
 
-    private func show(_ error: Error) {
-        guard !error.isUserCancellation else { return }
+    private func show(_ error: Error, while action: String) {
+        guard !error.isUserCancellation else {
+            Log.actions.info("\(action, privacy: .public): cancelled by the user")
+            return
+        }
+        Log.actions.error("\(action, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
         errorMessage = error.localizedDescription
+    }
+}
+
+extension PHAuthorizationStatus {
+    /// A readable name for logs.
+    var logName: String {
+        switch self {
+        case .notDetermined: "not determined"
+        case .restricted: "restricted"
+        case .denied: "denied"
+        case .authorized: "full"
+        case .limited: "limited"
+        @unknown default: "unknown (\(rawValue))"
+        }
     }
 }
