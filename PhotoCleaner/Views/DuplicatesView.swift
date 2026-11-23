@@ -148,18 +148,6 @@ struct GroupDetailView: View {
             ToolbarItem(placement: .primaryAction) { TrayButton() }
         }
         .sensoryFeedback(.success, trigger: decisions)
-        .confirmationDialog(
-            "Mark all \(group.memberIDs.count) photos for deletion?",
-            isPresented: $confirmMarkAll,
-            titleVisibility: .visible
-        ) {
-            Button("Mark all \(group.memberIDs.count), including Best", role: .destructive) {
-                model.markAll(of: group)
-                advance(after: group)
-            }
-        } message: {
-            Text(markAllMessage(for: group))
-        }
     }
 
     // MARK: Pieces
@@ -211,6 +199,19 @@ struct GroupDetailView: View {
                         .frame(maxWidth: .infinity, minHeight: 28)
                 }
                 .tint(.red)
+                // Attached here, not to the screen, so iOS anchors the bubble to this button.
+                .confirmationDialog(
+                    "Mark all \(group.memberIDs.count) photos for deletion?",
+                    isPresented: $confirmMarkAll,
+                    titleVisibility: .visible
+                ) {
+                    Button("Mark all \(group.memberIDs.count), including Best", role: .destructive) {
+                        model.markAll(of: group)
+                        advance(after: group)
+                    }
+                } message: {
+                    Text(markAllMessage(for: group))
+                }
 
                 Button {
                     advance(after: group, decided: false)
