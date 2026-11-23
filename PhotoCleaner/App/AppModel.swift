@@ -490,6 +490,17 @@ final class AppModel {
         tray.add(group.markableExtraIDs.filter { !preferences.keptIDs.contains($0) })
     }
 
+    /// Marks every photo in the group, including the best one, favorites and kept photos.
+    /// Only for an explicit, confirmed choice; it still goes through the tray, so nothing is deleted yet.
+    func markAll(of group: DuplicateGroup) {
+        tray.add(group.memberIDs)
+    }
+
+    /// Members of the group that are favorites or that the user chose to keep, the best one included.
+    func favoriteOrKeptCount(in group: DuplicateGroup) -> Int {
+        group.memberIDs.filter { metasByID[$0]?.isFavorite == true || preferences.keptIDs.contains($0) }.count
+    }
+
     /// One tap for exact copies only. Similar shots need a look, so they're not included.
     func markAllExactCopies() {
         tray.add(oneTapCopyIDs.filter { !preferences.keptIDs.contains($0) })

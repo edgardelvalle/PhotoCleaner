@@ -88,6 +88,7 @@ struct GroupDetailView: View {
 
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var confirmMarkAll = false
 
     var body: some View {
         ScrollView {
@@ -120,14 +121,44 @@ struct GroupDetailView: View {
                 Button("Keep best") { model.markExtras(of: group) }
                     .keyboardShortcut(.return, modifiers: .command)
             }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button("Mark all \(group.memberIDs.count) for deletion", systemImage: "trash", role: .destructive) {
+                        confirmMarkAll = true
+                    }
+                } label: {
+                    Label("More", systemImage: "ellipsis.circle")
+                }
+            }
             ToolbarItem(placement: .primaryAction) { TrayButton() }
         }
+        .confirmationDialog(
+            "Mark all \(group.memberIDs.count) photos for deletion?",
+            isPresented: $confirmMarkAll,
+            titleVisibility: .visible
+        ) {
+            Button("Mark all \(group.memberIDs.count), including Best", role: .destructive) {
+                model.markAll(of: group)
+            }
+        } message: {
+            Text(markAllMessage)
+        }
+    }
+
+    private var markAllMessage: String {
+        let protected = model.favoriteOrKeptCount(in: group)
+        let warning = switch protected {
+        case 0: ""
+        case 1: "This includes 1 favorite or kept photo. "
+        default: "This includes \(protected) favorites or kept photos. "
+        }
+        return "None of these will be kept, including the one marked Best. \(warning)Nothing is deleted yet. You can unmark them in the tray, and photos moved to To Delete can be restored."
     }
 
     private var explanation: String {
         let kind = group.kind == .exactCopies
             ? "These look like copies of the same photo."
             : "These were taken moments apart and look alike."
-        return "\(kind) The one marked Best is suggested to keep (\(group.keeperReason.rawValue.lowercased())). Keep best never marks favorites. Tap photos to mark or unmark them. Touch and hold to see one larger."
+        return "\(kind) The one marked Best is suggested to keep (\(group.keeperReason.rawValue.lowercased())). Keep best never marks favorites. To remove the whole group, choose Mark all from the menu. Tap photos to mark or unmark them. Touch and hold to see one larger."
     }
 }

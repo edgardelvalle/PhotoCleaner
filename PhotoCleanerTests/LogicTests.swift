@@ -272,3 +272,32 @@ final class ScanStatsTests: XCTestCase {
         XCTAssertEqual(metrics.snapshot, PhotoCounters())
     }
 }
+
+@MainActor
+final class MarkAllTests: XCTestCase {
+    private func group() -> DuplicateGroup {
+        DuplicateGroup(
+            id: "a|b|c",
+            memberIDs: ["a", "b", "c"],
+            keeperID: "b",
+            keeperReason: .favorite,
+            kind: .similarShots,
+            date: Date(timeIntervalSince1970: 0),
+            estimatedSavings: 0,
+            protectedIDs: ["c"]
+        )
+    }
+
+    func testKeepBestLeavesTheKeeperAndProtectedPhotos() {
+        XCTAssertEqual(group().markableExtraIDs, ["a"])
+    }
+
+    func testMarkingTheWholeGroupIncludesKeeperAndProtectedPhotos() {
+        let defaults = UserDefaults(suiteName: "MarkAllTests-\(UUID().uuidString)")!
+        let tray = TrayStore(defaults: defaults)
+        tray.add(["c"])
+        tray.add(group().memberIDs)
+        XCTAssertEqual(tray.orderedIDs, ["c", "a", "b"])
+        XCTAssertTrue(tray.contains("b"))
+    }
+}
