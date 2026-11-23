@@ -49,6 +49,9 @@ or photos you chose to keep. Similar shots are reviewed group by group.
   is the real delete. If the album is deleted in Photos, photos the app hid still show up here
   so they can be restored. iOS asks to confirm, and photos stay in Recently Deleted for 30 days.
 - **Delete now** in the tray skips the album.
+- **Delete all extras** at the top of Duplicates deletes every photo in every group except the
+  one marked Best, similar shots included. Favorites and kept photos are skipped. It asks in
+  the app first, then iOS asks to confirm; photos stay in Recently Deleted for 30 days.
 
 ## Project layout
 

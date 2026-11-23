@@ -42,6 +42,20 @@ struct ScanResults: Sendable {
     var oneOffs: [OneOffCandidate] = []
 }
 
+extension ScanResults {
+    /// Every extra photo across all duplicate groups, for "Delete all": each group keeps its
+    /// best photo, and favorites and photos the user chose to keep are never included.
+    /// A photo that is any group's keeper is never included, even if it also appears
+    /// as an extra elsewhere.
+    func deletableDuplicateExtraIDs(excluding keptIDs: Set<String>) -> [String] {
+        let keepers = Set(duplicateGroups.map(\.keeperID))
+        var seen = Set<String>()
+        return duplicateGroups
+            .flatMap(\.markableExtraIDs)
+            .filter { !keptIDs.contains($0) && !keepers.contains($0) && seen.insert($0).inserted }
+    }
+}
+
 struct ScanSettings: Sendable {
     var similarityThreshold: Float
     var keptIDs: Set<String>

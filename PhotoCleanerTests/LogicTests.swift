@@ -272,3 +272,51 @@ final class ScanStatsTests: XCTestCase {
         XCTAssertEqual(metrics.snapshot, PhotoCounters())
     }
 }
+
+final class DeleteAllDuplicatesTests: XCTestCase {
+    private func group(
+        _ ids: [String],
+        keeper: String,
+        kind: DuplicateGroup.Kind = .similarShots,
+        protected: Set<String> = []
+    ) -> DuplicateGroup {
+        DuplicateGroup(
+            id: ids.joined(separator: "|"),
+            memberIDs: ids,
+            keeperID: keeper,
+            keeperReason: .favorite,
+            kind: kind,
+            date: .distantPast,
+            estimatedSavings: 0,
+            protectedIDs: protected
+        )
+    }
+
+    func testIncludesExtrasFromEveryGroupKind() {
+        var results = ScanResults()
+        results.duplicateGroups = [
+            group(["a", "b", "c"], keeper: "b", kind: .exactCopies),
+            group(["d", "e"], keeper: "e"),
+        ]
+        XCTAssertEqual(results.deletableDuplicateExtraIDs(excluding: []), ["a", "c", "d"])
+    }
+
+    func testSkipsFavoritesAndKeptPhotos() {
+        var results = ScanResults()
+        results.duplicateGroups = [group(["a", "b", "c", "d"], keeper: "a", protected: ["b"])]
+        XCTAssertEqual(results.deletableDuplicateExtraIDs(excluding: ["c"]), ["d"])
+    }
+
+    func testNeverIncludesAnyGroupsKeeper() {
+        var results = ScanResults()
+        results.duplicateGroups = [
+            group(["a", "b"], keeper: "a"),
+            group(["b", "c", "c2"], keeper: "b"),
+        ]
+        XCTAssertEqual(results.deletableDuplicateExtraIDs(excluding: []), ["c", "c2"])
+    }
+
+    func testEmptyWhenNoGroups() {
+        XCTAssertTrue(ScanResults().deletableDuplicateExtraIDs(excluding: []).isEmpty)
+    }
+}

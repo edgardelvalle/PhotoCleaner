@@ -2,6 +2,7 @@ import SwiftUI
 
 struct DuplicatesView: View {
     @Environment(AppModel.self) private var model
+    @State private var confirmDeleteAll = false
 
     var body: some View {
         Group {
@@ -29,6 +30,23 @@ struct DuplicatesView: View {
                         }
                     }
 
+                    let deletableIDs = model.deletableDuplicateIDs
+                    if !deletableIDs.isEmpty {
+                        Section {
+                            Button(role: .destructive) {
+                                confirmDeleteAll = true
+                            } label: {
+                                Label(
+                                    "Delete all \(deletableIDs.count) extras (\(model.bytes(deletableIDs).bytesText))",
+                                    systemImage: "trash"
+                                )
+                            }
+                            .disabled(model.isWorking)
+                        } footer: {
+                            Text("Deletes every photo in every group except the one marked Best, including similar shots you haven't reviewed. Favorites and photos you kept are skipped. Photos stay in Recently Deleted for 30 days.")
+                        }
+                    }
+
                     Section {
                         ForEach(model.results.duplicateGroups) { group in
                             NavigationLink(value: group) {
@@ -40,6 +58,18 @@ struct DuplicatesView: View {
             }
         }
         .navigationTitle("Duplicates")
+        .confirmationDialog(
+            "Delete all duplicate extras?",
+            isPresented: $confirmDeleteAll,
+            titleVisibility: .visible
+        ) {
+            let ids = model.deletableDuplicateIDs
+            Button("Delete \(ids.count) photos", role: .destructive) {
+                Task { await model.deleteAllDuplicateExtras() }
+            }
+        } message: {
+            Text("The best photo in each group is kept. Similar shots are included, so open a group first if you want to choose yourself. Deleted photos stay in Recently Deleted for 30 days.")
+        }
         .navigationDestination(for: DuplicateGroup.self) { group in
             GroupDetailView(group: group)
         }

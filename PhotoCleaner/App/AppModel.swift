@@ -471,6 +471,11 @@ final class AppModel {
     var oneTapCopyIDs: [String] {
         results.duplicateGroups.filter { $0.kind == .exactCopies }.flatMap(\.markableExtraIDs)
     }
+    /// Extras "Delete all" removes: every group, keeping each one's best photo,
+    /// never favorites or kept photos.
+    var deletableDuplicateIDs: [String] {
+        results.deletableDuplicateExtraIDs(excluding: preferences.keptIDs)
+    }
     var duplicateSavings: Int64 { results.duplicateGroups.reduce(0) { $0 + $1.estimatedSavings } }
     var screenshotSavings: Int64 { bytes(results.screenshotIDs) }
     var oneOffSavings: Int64 { bytes(results.oneOffs.map(\.id)) }
@@ -552,6 +557,29 @@ final class AppModel {
             return true
         } catch {
             show(error, while: "Deleting \(assets.count) photos")
+            return false
+        }
+    }
+
+    /// Deletes every duplicate extra right away, keeping the best photo of each group.
+    /// iOS asks for confirmation, and photos stay in Recently Deleted for 30 days.
+    @discardableResult
+    func deleteAllDuplicateExtras() async -> Bool {
+        let ids = deletableDuplicateIDs
+        let assets = ids.compactMap { asset($0) }
+        guard !assets.isEmpty else { return false }
+        let freed = bytes(assets.map(\.localIdentifier))
+        beginOwnChange()
+        defer { endOwnChange() }
+        do {
+            try await album.delete(assets)
+            preferences.lifetimeFreedBytes += freed
+            Log.actions.notice("Deleted \(assets.count) duplicate extras with Delete all")
+            tray.remove(ids)
+            startScan()
+            return true
+        } catch {
+            show(error, while: "Deleting \(assets.count) duplicate extras")
             return false
         }
     }
