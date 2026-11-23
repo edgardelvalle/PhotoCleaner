@@ -16,7 +16,9 @@ struct AssetImage: View {
 
     var body: some View {
         ZStack {
-            if let image {
+            // Only draw an image loaded for this asset: when a view is reused for another photo,
+            // the old image would otherwise show until the new request starts.
+            if let image, loadedID == asset.localIdentifier {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)

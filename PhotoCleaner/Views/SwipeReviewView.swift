@@ -1,4 +1,5 @@
 import SwiftUI
+import Photos
 
 struct SwipeItem: Hashable {
     let id: String
@@ -12,6 +13,10 @@ struct SwipeReviewView: View {
     let items: [SwipeItem]
 
     @Environment(AppModel.self) private var model
+    /// The photos being reviewed, fixed when the review opens. The category lists keep
+    /// rebuilding while the review is open (marking, keeping, a scan finishing), and following
+    /// them would shift `index` onto a different photo mid-review. New finds go at the end.
+    @State private var queue: [SwipeItem]
     @State private var index = 0
     @State private var history: [(index: Int, decision: Decision)] = []
     @State private var drag: CGSize = .zero
@@ -21,15 +26,25 @@ struct SwipeReviewView: View {
     enum Decision { case keep, delete }
 
     private let swipeDistance: CGFloat = 120
-    private var current: SwipeItem? { index < items.count ? items[index] : nil }
-    private var next: SwipeItem? { index + 1 < items.count ? items[index + 1] : nil }
+
+    init(title: String, items: [SwipeItem]) {
+        self.title = title
+        self.items = items
+        _queue = State(initialValue: items)
+    }
+
+    private var current: SwipeItem? { index < queue.count ? queue[index] : nil }
+    /// The top card and the one under it, bottom first.
+    private var visibleCards: [SwipeItem] {
+        Array(queue[min(index, queue.count)..<min(index + 2, queue.count)].reversed())
+    }
 
     var body: some View {
         VStack(spacing: 16) {
             if current != nil {
                 VStack(spacing: 4) {
-                    ProgressView(value: Double(index), total: Double(max(items.count, 1)))
-                    Text("\(index + 1) of \(items.count)")
+                    ProgressView(value: Double(index), total: Double(max(queue.count, 1)))
+                    Text("\(index + 1) of \(queue.count)")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -37,28 +52,15 @@ struct SwipeReviewView: View {
             }
 
             ZStack {
-                if let next, let asset = model.asset(next.id) {
-                    card(AssetImage(asset: asset, side: 1200, contentMode: .fit), reason: nil)
-                        .scaleEffect(0.94)
-                        .opacity(0.4)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-                if let current, let asset = model.asset(current.id) {
-                    card(AssetImage(asset: asset, side: 1200, contentMode: .fit), reason: current.reason)
-                        .overlay(alignment: .top) { stamp }
-                        .offset(x: drag.width, y: drag.height * 0.2)
-                        .rotationEffect(.degrees(Double(drag.width / 25)))
-                        .gesture(dragGesture)
-                        .id(current.id)
-                        .accessibilityElement()
-                        .accessibilityLabel(current.reason ?? "Photo")
-                        .accessibilityActions {
-                            Button("Delete") { decide(.delete) }
-                            Button("Keep") { decide(.keep) }
-                        }
-                } else if current == nil {
+                if current == nil {
                     finishedView
+                }
+                // Keyed by photo, so the card underneath becomes the top card as the same view,
+                // with its image already loaded, instead of a fresh view loading from scratch.
+                ForEach(visibleCards, id: \.id) { item in
+                    if let asset = model.asset(item.id) {
+                        cardView(item, asset: asset, isTop: item.id == current?.id)
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -71,9 +73,36 @@ struct SwipeReviewView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) { TrayButton() }
         }
+        .onChange(of: items) { _, latest in
+            let known = Set(queue.map(\.id))
+            queue.append(contentsOf: latest.filter { !known.contains($0.id) })
+        }
         .onDisappear {
             Task { await model.refreshResults() }
         }
+    }
+
+    @ViewBuilder
+    private func cardView(_ item: SwipeItem, asset: PHAsset, isTop: Bool) -> some View {
+        card(AssetImage(asset: asset, side: 1200, contentMode: .fit), reason: item.reason)
+            .overlay(alignment: .top) { if isTop { stamp } }
+            .scaleEffect(isTop ? 1 : 0.94)
+            .opacity(isTop ? 1 : 0.4)
+            .offset(x: isTop ? drag.width : 0, y: isTop ? drag.height * 0.2 : 0)
+            .rotationEffect(.degrees(isTop ? Double(drag.width / 25) : 0))
+            .gesture(dragGesture)
+            .allowsHitTesting(isTop)
+            .zIndex(isTop ? 1 : 0)
+            // A decided card is already off screen when it leaves; an undone one flies back in
+            // from where it left. Neither needs a fade.
+            .transition(.identity)
+            .accessibilityElement()
+            .accessibilityLabel(item.reason ?? "Photo")
+            .accessibilityHidden(!isTop)
+            .accessibilityActions {
+                Button("Delete") { decide(.delete) }
+                Button("Keep") { decide(.keep) }
+            }
     }
 
     private func card(_ image: AssetImage, reason: String?) -> some View {
@@ -190,15 +219,18 @@ struct SwipeReviewView: View {
         withAnimation(.easeIn(duration: 0.18)) {
             drag = CGSize(width: decision == .delete ? -900 : 900, height: drag.height)
         } completion: {
-            drag = .zero
-            index += 1
+            // The card underneath grows into place; the decided card is already off screen.
+            withAnimation(.easeOut(duration: 0.2)) {
+                drag = .zero
+                index += 1
+            }
             isAnimating = false
         }
     }
 
     private func undo() {
         guard !isAnimating, let last = history.popLast() else { return }
-        let id = items[last.index].id
+        let id = queue[last.index].id
         switch last.decision {
         case .delete:
             model.tray.remove([id])
@@ -206,6 +238,13 @@ struct SwipeReviewView: View {
         case .keep:
             model.unkeep(id)
         }
-        withAnimation(.spring) { index = last.index }
+        // Bring the card back from the side it left on: insert it off screen, then let it spring in.
+        withAnimation(.spring) {
+            drag = CGSize(width: last.decision == .delete ? -900 : 900, height: 0)
+            index = last.index
+        }
+        DispatchQueue.main.async {
+            withAnimation(.spring) { drag = .zero }
+        }
     }
 }
