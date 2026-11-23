@@ -217,3 +217,58 @@ final class ImageLoaderTests: XCTestCase {
         XCTAssertEqual(ImageLoader.bucketed(3000), 3000)
     }
 }
+
+final class ScanStatsTests: XCTestCase {
+    func testTimingTracksMeanAndMax() {
+        var timing = Timing()
+        XCTAssertNil(timing.mean)
+        timing.add(0.1)
+        timing.add(0.3)
+        XCTAssertEqual(timing.count, 2)
+        XCTAssertEqual(timing.mean ?? 0, 0.2, accuracy: 1e-9)
+        XCTAssertEqual(timing.max, 0.3, accuracy: 1e-9)
+    }
+
+    func testPhotosPerSecondCountsBothPasses() {
+        var stats = ScanStats()
+        XCTAssertNil(stats.photosPerSecond)
+        stats.localPass = 10
+        stats.iCloudPass = 10
+        stats.photos.analyzedLocal = 300
+        stats.photos.analyzedDownloaded = 100
+        XCTAssertEqual(stats.photosPerSecond ?? 0, 20, accuracy: 1e-9)
+    }
+
+    func testErrorsKeepOnlyTheMostRecent() {
+        var stats = ScanStats()
+        for i in 0..<(ScanStats.maxErrors + 5) { stats.addError("error \(i)") }
+        XCTAssertEqual(stats.errors.count, ScanStats.maxErrors)
+        XCTAssertEqual(stats.errors.last, "error \(ScanStats.maxErrors + 4)")
+        XCTAssertEqual(stats.errors.first, "error 5")
+    }
+
+    func testReportIncludesCountsAndErrors() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        var stats = ScanStats(outcome: .finished, startedAt: start)
+        stats.finishedAt = start.addingTimeInterval(42)
+        stats.libraryCount = 1234
+        stats.photos.downloadFailed = 7
+        stats.addError("Saving the cache: disk full")
+        let report = stats.report()
+        XCTAssertTrue(report.contains("Status: Finished"))
+        XCTAssertTrue(report.contains("Duration: 42.0 s"))
+        XCTAssertTrue(report.contains("Library: 1234 photos"))
+        XCTAssertTrue(report.contains("Download failed: 7"))
+        XCTAssertTrue(report.contains("- Saving the cache: disk full"))
+    }
+
+    func testPhotoMetricsRecordsAndResets() {
+        let metrics = PhotoMetrics()
+        DispatchQueue.concurrentPerform(iterations: 100) { _ in
+            metrics.record { $0.analyzedLocal += 1 }
+        }
+        XCTAssertEqual(metrics.snapshot.analyzedLocal, 100)
+        metrics.reset()
+        XCTAssertEqual(metrics.snapshot, PhotoCounters())
+    }
+}
