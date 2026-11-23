@@ -147,6 +147,8 @@ struct GroupDetailView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) { TrayButton() }
         }
+        // Reviewing is a focused flow; hiding the tab bar keeps its buttons away from the decisions.
+        .toolbar(.hidden, for: .tabBar)
         .sensoryFeedback(.success, trigger: decisions)
     }
 
@@ -178,20 +180,21 @@ struct GroupDetailView: View {
     }
 
     private func actionBar(for group: DuplicateGroup) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 16) {
             Button {
                 model.markExtras(of: group)
                 advance(after: group)
             } label: {
                 Label("Keep best", systemImage: "checkmark.circle.fill")
                     .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 34)
+                    .frame(maxWidth: .infinity, minHeight: 40)
             }
             .buttonStyle(.borderedProminent)
             .tint(.green)
             .keyboardShortcut(.return, modifiers: .command)
 
-            HStack(spacing: 8) {
+            // Keep the destructive button well apart from the others to avoid mis-taps.
+            HStack(spacing: 24) {
                 Button(role: .destructive) {
                     confirmMarkAll = true
                 } label: {
@@ -227,8 +230,8 @@ struct GroupDetailView: View {
         }
         .disabled(isAdvancing)
         .padding(.horizontal)
-        .padding(.top, 10)
-        .padding(.bottom, 6)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
         .background(.bar)
     }
 
