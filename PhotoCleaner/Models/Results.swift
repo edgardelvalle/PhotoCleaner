@@ -27,6 +27,16 @@ struct DuplicateGroup: Identifiable, Hashable, Sendable {
     }
 }
 
+extension Array where Element == DuplicateGroup {
+    /// The group to review after `id`: the next one in the list with nothing marked yet.
+    /// Doesn't wrap around, so skipping through the list ends at the last group.
+    /// If `id` is no longer in the list (it was rebuilt), starts from the top.
+    func nextUndecided(after id: String, isMarked: (String) -> Bool) -> DuplicateGroup? {
+        let start = firstIndex { $0.id == id }.map { index(after: $0) } ?? startIndex
+        return self[start...].first { !$0.memberIDs.contains(where: isMarked) }
+    }
+}
+
 struct OneOffCandidate: Identifiable, Hashable, Sendable {
     let id: String
     let reason: String

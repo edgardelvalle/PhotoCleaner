@@ -83,18 +83,43 @@ struct DuplicateGroupRow: View {
     }
 }
 
+/// Reviews duplicate groups one after another. The decision buttons sit at the bottom, and
+/// choosing one moves straight on to the next group that has nothing marked yet, so the whole
+/// list can be cleared without going back to it.
 struct GroupDetailView: View {
-    let group: DuplicateGroup
-
     @Environment(AppModel.self) private var model
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var currentID: String
+    @State private var fallback: DuplicateGroup
     @State private var confirmMarkAll = false
+    @State private var showInfo = false
+    @State private var isAdvancing = false
+    @State private var decisions = 0
+
+    init(group: DuplicateGroup) {
+        _currentID = State(initialValue: group.id)
+        _fallback = State(initialValue: group)
+    }
+
+    /// The group on screen. Falls back to the last one shown if the list was rebuilt without it.
+    private var group: DuplicateGroup {
+        model.results.duplicateGroups.first { $0.id == currentID } ?? fallback
+    }
+
+    private var position: (index: Int, count: Int)? {
+        let groups = model.results.duplicateGroups
+        guard let index = groups.firstIndex(where: { $0.id == currentID }) else { return nil }
+        return (index + 1, groups.count)
+    }
+
+    private var anyMarked: Bool { group.memberIDs.contains { model.tray.contains($0) } }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                Text(explanation)
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 12) {
+                hint(for: group)
 
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: sizeClass == .compact ? 150 : 280), spacing: 12)], spacing: 12) {
                     ForEach(group.memberIDs, id: \.self) { id in
@@ -114,24 +139,15 @@ struct GroupDetailView: View {
             }
             .padding()
         }
-        .navigationTitle(group.title)
+        .id(group.id)
+        .transition(.push(from: .trailing))
+        .safeAreaInset(edge: .bottom) { actionBar(for: group) }
+        .navigationTitle(position.map { "\($0.index) of \($0.count)" } ?? group.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button("Keep best") { model.markExtras(of: group) }
-                    .keyboardShortcut(.return, modifiers: .command)
-            }
-            ToolbarItem(placement: .primaryAction) {
-                Menu {
-                    Button("Mark all \(group.memberIDs.count) for deletion", systemImage: "trash", role: .destructive) {
-                        confirmMarkAll = true
-                    }
-                } label: {
-                    Label("More", systemImage: "ellipsis.circle")
-                }
-            }
             ToolbarItem(placement: .primaryAction) { TrayButton() }
         }
+        .sensoryFeedback(.success, trigger: decisions)
         .confirmationDialog(
             "Mark all \(group.memberIDs.count) photos for deletion?",
             isPresented: $confirmMarkAll,
@@ -139,13 +155,103 @@ struct GroupDetailView: View {
         ) {
             Button("Mark all \(group.memberIDs.count), including Best", role: .destructive) {
                 model.markAll(of: group)
+                advance(after: group)
             }
         } message: {
-            Text(markAllMessage)
+            Text(markAllMessage(for: group))
         }
     }
 
-    private var markAllMessage: String {
+    // MARK: Pieces
+
+    private func hint(for group: DuplicateGroup) -> some View {
+        HStack(spacing: 6) {
+            Text("\(group.kind == .exactCopies ? "Copies" : "Similar shots") · Best: \(group.keeperReason.rawValue.lowercased())")
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+            Spacer(minLength: 0)
+            Button {
+                showInfo = true
+            } label: {
+                Image(systemName: "info.circle")
+            }
+            .accessibilityLabel("How this works")
+            .popover(isPresented: $showInfo) {
+                Text(explanation(for: group))
+                    .font(.callout)
+                    .padding()
+                    .frame(idealWidth: 320)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .presentationCompactAdaptation(.popover)
+            }
+        }
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+    }
+
+    private func actionBar(for group: DuplicateGroup) -> some View {
+        VStack(spacing: 8) {
+            Button {
+                model.markExtras(of: group)
+                advance(after: group)
+            } label: {
+                Label("Keep best", systemImage: "checkmark.circle.fill")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 34)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .keyboardShortcut(.return, modifiers: .command)
+
+            HStack(spacing: 8) {
+                Button(role: .destructive) {
+                    confirmMarkAll = true
+                } label: {
+                    Label("Delete all", systemImage: "trash")
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                }
+                .tint(.red)
+
+                Button {
+                    advance(after: group, decided: false)
+                } label: {
+                    // After marking photos by hand, this is how to move on.
+                    Label(anyMarked ? "Next" : "Skip", systemImage: "arrow.right")
+                        .frame(maxWidth: .infinity, minHeight: 28)
+                }
+                .keyboardShortcut(.rightArrow, modifiers: .command)
+            }
+            .buttonStyle(.bordered)
+        }
+        .disabled(isAdvancing)
+        .padding(.horizontal)
+        .padding(.top, 10)
+        .padding(.bottom, 6)
+        .background(.bar)
+    }
+
+    // MARK: Flow
+
+    /// Shows the next group with nothing marked yet, or goes back to the list when there are none.
+    /// Waits a moment after a decision so the marks are visible before the screen changes.
+    private func advance(after group: DuplicateGroup, decided: Bool = true) {
+        if decided { decisions += 1 }
+        isAdvancing = true
+        Task {
+            if decided { try? await Task.sleep(for: .milliseconds(350)) }
+            defer { isAdvancing = false }
+            guard let next = model.results.duplicateGroups.nextUndecided(after: group.id, isMarked: model.tray.contains) else {
+                dismiss()
+                return
+            }
+            withAnimation(.snappy) {
+                fallback = next
+                currentID = next.id
+            }
+        }
+    }
+
+    private func markAllMessage(for group: DuplicateGroup) -> String {
         let protected = model.favoriteOrKeptCount(in: group)
         let warning = switch protected {
         case 0: ""
@@ -155,10 +261,10 @@ struct GroupDetailView: View {
         return "None of these will be kept, including the one marked Best. \(warning)Nothing is deleted yet. You can unmark them in the tray, and photos moved to To Delete can be restored."
     }
 
-    private var explanation: String {
+    private func explanation(for group: DuplicateGroup) -> String {
         let kind = group.kind == .exactCopies
             ? "These look like copies of the same photo."
             : "These were taken moments apart and look alike."
-        return "\(kind) The one marked Best is suggested to keep (\(group.keeperReason.rawValue.lowercased())). Keep best never marks favorites. To remove the whole group, choose Mark all from the menu. Tap photos to mark or unmark them. Touch and hold to see one larger."
+        return "\(kind) The one marked Best is suggested to keep. Keep best marks the others, but never favorites or photos you kept. Delete all marks the whole group after asking. Tap photos to mark or unmark them, then tap Next. Touch and hold to see one larger. Marked photos wait in the tray, so nothing is deleted yet."
     }
 }
