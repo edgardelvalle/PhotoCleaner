@@ -204,3 +204,16 @@ final class OneOffScorerTests: XCTestCase {
         XCTAssertFalse(ReceiptWords.matches(["Happy birthday!"]))
     }
 }
+
+final class ImageLoaderTests: XCTestCase {
+    func testSizesRoundUpToSharedBuckets() {
+        XCTAssertEqual(ImageLoader.bucketed(100), 128)
+        XCTAssertEqual(ImageLoader.bucketed(330), 384)
+        XCTAssertEqual(ImageLoader.bucketed(384), 384)
+        XCTAssertEqual(ImageLoader.bucketed(1000), 1024)
+    }
+
+    func testVeryLargeSizesAreKept() {
+        XCTAssertEqual(ImageLoader.bucketed(3000), 3000)
+    }
+}

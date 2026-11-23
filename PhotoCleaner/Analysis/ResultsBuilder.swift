@@ -6,13 +6,35 @@ import Vision
 ///
 /// It is the only owner of feature prints in memory: they are decoded once when ingested,
 /// and the archived bytes are dropped everywhere else, so each print is held once.
+private struct SendableBuffer<Element>: @unchecked Sendable {
+    let buffer: UnsafeMutableBufferPointer<Element>
+}
+
 actor ResultsBuilder {
     private var prints: [String: VNFeaturePrintObservation] = [:]
 
-    /// Takes in new analysis results and decodes their feature prints.
+    /// Takes in new analysis results and decodes their feature prints. Large batches (the
+    /// cache loaded at launch) are decoded on all cores.
     func ingest(_ snapshots: [AssetAnalysisSnapshot]) {
-        for snapshot in snapshots {
-            prints[snapshot.id] = snapshot.featurePrint.flatMap(VisionAnalyzer.decodeFeaturePrint)
+        guard snapshots.count > 256 else {
+            for snapshot in snapshots {
+                prints[snapshot.id] = snapshot.featurePrint.flatMap(VisionAnalyzer.decodeFeaturePrint)
+            }
+            return
+        }
+        let decoded = UnsafeMutableBufferPointer<VNFeaturePrintObservation?>.allocate(capacity: snapshots.count)
+        decoded.initialize(repeating: nil)
+        defer {
+            decoded.deinitialize()
+            decoded.deallocate()
+        }
+        let output = SendableBuffer(buffer: decoded)
+        DispatchQueue.concurrentPerform(iterations: snapshots.count) { index in
+            // Each index is written by exactly one iteration.
+            output.buffer[index] = snapshots[index].featurePrint.flatMap(VisionAnalyzer.decodeFeaturePrint)
+        }
+        for (index, snapshot) in snapshots.enumerated() {
+            prints[snapshot.id] = decoded[index]
         }
     }
 

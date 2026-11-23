@@ -2,6 +2,8 @@ import Foundation
 import Photos
 import Observation
 import SwiftData
+import UIKit
+import os
 
 enum AppSection: Hashable {
     case overview, duplicates, screenshots, oneOffs, cleanup
@@ -12,9 +14,16 @@ enum AppSection: Hashable {
 @MainActor
 @Observable
 final class AppModel {
-    static let scanConcurrency = 4
-    /// During a scan, the cleanup lists are rebuilt at most this often.
-    static let refreshInterval: TimeInterval = 10
+    /// Photos analyzed at once when everything is on the device (CPU and Neural Engine bound).
+    static let localConcurrency = min(6, max(2, ProcessInfo.processInfo.activeProcessorCount))
+    /// Photos analyzed at once when they first have to come from iCloud (network bound).
+    static let downloadConcurrency = 6
+    /// During a scan, the first results show after this long...
+    static let firstRefreshDelay: TimeInterval = 2
+    /// ...and the cleanup lists are rebuilt at most this often after that.
+    static let refreshInterval: TimeInterval = 8
+    /// The progress bar is updated at most this often.
+    static let progressInterval: TimeInterval = 0.25
 
     var authorization: PHAuthorizationStatus
     var selectedSection: AppSection = .overview
@@ -26,6 +35,8 @@ final class AppModel {
     var errorMessage: String?
     /// iCloud photos skipped in the last scan because of a cellular connection.
     var skippedForCellular = 0
+    /// Rough time left in the current scan, once there is enough to estimate it.
+    var scanTimeRemaining: TimeInterval?
 
     let preferences = Preferences()
     let tray = TrayStore()
@@ -136,71 +147,62 @@ final class AppModel {
 
     private func runScan() async {
         if case .scanning = scanState {} else { scanState = .preparing }
+        // A long first scan stops if the phone locks, so keep the screen on while it runs,
+        // and ask for a little extra time when the app is switched away from.
+        UIApplication.shared.isIdleTimerDisabled = true
+        var backgroundTask = UIBackgroundTaskIdentifier.invalid
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Photo scan") {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+        let started = Date()
+        defer {
+            UIApplication.shared.isIdleTimerDisabled = false
+            scanTimeRemaining = nil
+            if backgroundTask != .invalid { UIApplication.shared.endBackgroundTask(backgroundTask) }
+        }
         let albumID = preferences.cleanupAlbumID
         let hiddenByApp = preferences.hiddenByApp
-        let snapshot = await Task.detached(priority: .userInitiated) {
-            LibraryReader.read(cleanupAlbumID: albumID, hiddenByApp: hiddenByApp)
-        }.value
-        apply(snapshot, checkedHiddenIDs: hiddenByApp)
 
+        // Read the library and load the analysis cache at the same time.
+        let readLibrary = Task.detached(priority: .userInitiated) {
+            LibraryReader.read(cleanupAlbumID: albumID, hiddenByApp: hiddenByApp)
+        }
         if !analysesLoaded, let store {
             let cached = (try? await store.allSnapshots()) ?? [:]
             await builder.ingest(Array(cached.values))
             analyses = cached.mapValues(\.withoutFeaturePrint)
             analysesLoaded = true
         }
+        let snapshot = await readLibrary.value
+        apply(snapshot, checkedHiddenIDs: hiddenByApp)
         await refreshResults()
-        var lastRefresh = Date()
 
         let todo = snapshot.metas.filter { meta in
             guard let cached = analyses[meta.id] else { return true }
             return cached.modificationDate != meta.modificationDate || cached.analyzerVersion != AssetAnalyzer.version
         }
         let total = snapshot.metas.count
-        var done = total - todo.count
-        var pending: [AssetAnalysisSnapshot] = []
-        var hasNewResults = false
-        var skipped = 0
-        let allowCellular = preferences.useCellularForICloud
-        scanState = .scanning(done: done, total: total)
+        progress = ScanProgress(done: total - todo.count, total: total)
+        scanState = .scanning(done: progress.done, total: total)
 
-        await withTaskGroup(of: AssetAnalysisSnapshot?.self) { group in
-            var queue = todo.makeIterator()
-            for _ in 0..<Self.scanConcurrency {
-                guard let meta = queue.next() else { break }
-                group.addTask { await AssetAnalyzer.analyze(meta, allowCellular: allowCellular) }
-            }
-            while let result = await group.next() {
-                done += 1
-                if let result {
-                    await builder.ingest([result])
-                    analyses[result.id] = result.withoutFeaturePrint
-                    pending.append(result)
-                    hasNewResults = true
-                } else {
-                    skipped += 1
-                }
-                scanState = .scanning(done: done, total: total)
-                if pending.count >= 100 {
-                    try? await store?.save(pending)
-                    pending.removeAll()
-                }
-                if hasNewResults, Date().timeIntervalSince(lastRefresh) >= Self.refreshInterval {
-                    hasNewResults = false
-                    lastRefresh = Date()
-                    await refreshResults()
-                }
-                if Task.isCancelled {
-                    group.cancelAll()
-                    break
-                }
-                if let meta = queue.next() {
-                    group.addTask { await AssetAnalyzer.analyze(meta, allowCellular: allowCellular) }
-                }
+        // Pass 1: photos already on the device, newest first. No downloads, so this is fast
+        // and most results show up early. Photos that need iCloud are left for pass 2.
+        let needDownload = await analyze(todo, allowNetwork: false, concurrency: Self.localConcurrency)
+
+        // Pass 2: photos that have to be downloaded from iCloud first.
+        let allowCellular = preferences.useCellularForICloud
+        var skipped = 0
+        if !Task.isCancelled, !needDownload.isEmpty {
+            if allowCellular || !NetworkMonitor.shared.isExpensive {
+                let failed = await analyze(needDownload, allowNetwork: true, concurrency: Self.downloadConcurrency)
+                skipped = failed.count
+            } else {
+                skipped = needDownload.count
             }
         }
+        await finishRefresh()
 
-        try? await store?.save(pending)
         skippedForCellular = (!allowCellular && NetworkMonitor.shared.isExpensive) ? skipped : 0
         let existing = Set(snapshot.metas.map(\.id)).union(snapshot.cleanupIDs)
         if !Task.isCancelled {
@@ -210,6 +212,111 @@ final class AppModel {
         }
         await refreshResults()
         scanState = Task.isCancelled ? .idle : .finished(Date())
+        let seconds = Date().timeIntervalSince(started)
+        Self.log.info("Scan: \(todo.count) to analyze, \(needDownload.count) needed iCloud, \(skipped) skipped, \(Int(seconds)) s")
+    }
+
+    private static let log = Logger(subsystem: "PhotoCleaner", category: "scan")
+
+    private struct ScanProgress {
+        var done = 0
+        var total = 0
+        var lastShown = Date.distantPast
+    }
+
+    @ObservationIgnored private var progress = ScanProgress()
+
+    /// Results analyzed but not yet handed to the results builder.
+    @ObservationIgnored private var unbuilt: [AssetAnalysisSnapshot] = []
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    @ObservationIgnored private var lastRefresh = Date()
+    @ObservationIgnored private var refreshedDuringScan = false
+
+    /// Analyzes `metas` a few at a time, saving to the cache in batches and refreshing the
+    /// lists in the background now and then, so the scan never waits for a rebuild.
+    /// - Returns: the photos that couldn't be analyzed (not on the device, or offline).
+    private func analyze(
+        _ metas: [AssetMeta],
+        allowNetwork: Bool,
+        concurrency: Int
+    ) async -> [AssetMeta] {
+        var failed: [AssetMeta] = []
+        var pending: [AssetAnalysisSnapshot] = []
+        let scanStart = Date()
+        var analyzedThisPass = 0
+
+        await withTaskGroup(of: (AssetMeta, AssetAnalysisSnapshot?).self) { group in
+            var queue = metas.makeIterator()
+            for _ in 0..<concurrency {
+                guard let meta = queue.next() else { break }
+                group.addTask { (meta, await AssetAnalyzer.analyze(meta, allowNetwork: allowNetwork)) }
+            }
+            while let next = await group.next() {
+                let (meta, result) = next
+                if let result {
+                    progress.done += 1
+                    analyzedThisPass += 1
+                    analyses[result.id] = result.withoutFeaturePrint
+                    unbuilt.append(result)
+                    pending.append(result)
+                } else if !Task.isCancelled {
+                    failed.append(meta)
+                }
+                let now = Date()
+                if now.timeIntervalSince(progress.lastShown) >= Self.progressInterval {
+                    progress.lastShown = now
+                    scanState = .scanning(done: progress.done, total: progress.total)
+                    let elapsed = now.timeIntervalSince(scanStart)
+                    if analyzedThisPass >= 30, elapsed > 5 {
+                        let rate = Double(analyzedThisPass) / elapsed
+                        scanTimeRemaining = Double(max(0, progress.total - progress.done)) / rate
+                    }
+                }
+                if pending.count >= 200 {
+                    let batch = pending
+                    pending.removeAll()
+                    try? await store?.save(batch)
+                }
+                let interval = refreshedDuringScan ? Self.refreshInterval : Self.firstRefreshDelay
+                let since = refreshedDuringScan ? lastRefresh : scanStart
+                if !unbuilt.isEmpty, refreshTask == nil, now.timeIntervalSince(since) >= interval {
+                    startBackgroundRefresh()
+                }
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                if let upcoming = queue.next() {
+                    group.addTask { (upcoming, await AssetAnalyzer.analyze(upcoming, allowNetwork: allowNetwork)) }
+                }
+            }
+        }
+        try? await store?.save(pending)
+        scanState = .scanning(done: progress.done, total: progress.total)
+        return failed
+    }
+
+    /// Rebuilds the lists without holding up the scan loop.
+    private func startBackgroundRefresh() {
+        let batch = unbuilt
+        unbuilt.removeAll()
+        refreshTask = Task {
+            await builder.ingest(batch)
+            await refreshResults()
+            lastRefresh = Date()
+            refreshedDuringScan = true
+            refreshTask = nil
+        }
+    }
+
+    /// Waits for a background rebuild and hands over everything still unbuilt.
+    private func finishRefresh() async {
+        await refreshTask?.value
+        refreshTask = nil
+        refreshedDuringScan = false
+        let batch = unbuilt
+        unbuilt.removeAll()
+        await builder.ingest(batch)
     }
 
     /// - Parameter checkedHiddenIDs: the hidden-by-app ids the snapshot was read with. Only

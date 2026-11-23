@@ -95,7 +95,7 @@ struct DashboardView: View {
                     Button("Stop") { model.cancelScan() }
                 }
                 ScanProgressView()
-                Text("You can start cleaning while this runs. Keep the app open for the first scan.")
+                Text("You can start cleaning while this runs. Keep the app open for the first scan; the screen stays on until it’s done.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             case .finished(let date):
