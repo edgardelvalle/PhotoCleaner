@@ -125,21 +125,31 @@ struct SwipeReviewView: View {
     }
 
     private var controls: some View {
-        HStack(spacing: 20) {
+        HStack(spacing: 12) {
             Button(role: .destructive) { decide(.delete) } label: {
-                Label("Delete", systemImage: "trash").frame(minWidth: 90)
+                Label("Delete", systemImage: "trash")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(maxWidth: .infinity)
             }
             .tint(.red)
             .keyboardShortcut(.leftArrow, modifiers: [])
 
             Button { undo() } label: {
+                // Icon-only so it never wraps; the Label still gives VoiceOver "Undo".
                 Label("Undo", systemImage: "arrow.uturn.backward")
+                    .labelStyle(.iconOnly)
             }
+            .fixedSize()
+            .help("Undo")
             .disabled(history.isEmpty)
             .keyboardShortcut("z", modifiers: .command)
 
             Button { decide(.keep) } label: {
-                Label("Keep", systemImage: "checkmark").frame(minWidth: 90)
+                Label("Keep", systemImage: "checkmark")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(maxWidth: .infinity)
             }
             .tint(.green)
             .keyboardShortcut(.rightArrow, modifiers: [])
