@@ -76,8 +76,17 @@ struct SelectableTile: View {
         Button(action: action) {
             Color.clear
                 .aspectRatio(1, contentMode: .fit)
-                .overlay { AssetImage(asset: asset, side: 300, contentMode: contentMode) } // MarkableGrid.tileCap
+                .overlay {
+                    // A filled photo lays out larger than the tile (a tall screenshot overflows
+                    // above and below). Pin it to the tile so it can't spill into its neighbors.
+                    AssetImage(asset: asset, side: 300, contentMode: contentMode) // MarkableGrid.tileCap
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipped()
+                }
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                // Clipping only hides the overflow; taps still land on it. Without this, tapping
+                // the bottom of a tile could toggle the tall photo in the row below.
+                .contentShape([.interaction, .contextMenuPreview], RoundedRectangle(cornerRadius: 8))
                 .overlay {
                     if isOn {
                         RoundedRectangle(cornerRadius: 8)
